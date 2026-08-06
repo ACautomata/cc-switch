@@ -319,7 +319,7 @@ async function handleKey(key) {
     process.exit(0);
   } else if (key === "t") {
     CONFIG.injectShape = CONFIG.injectShape === "advisor_tool_result" ? "tool_result" : "advisor_tool_result";
-    note(`切换回注形状 → ${CONFIG.injectShape}(实测 D2:第三方对未知块 type 容忍度)`);
+    note(`切换回注形状 → ${CONFIG.injectShape}。实测(#7):k3 端点对 advisor_tool_result 未知块 400、对 tool_result 200——advisor_tool_result 分支预期续跑失败,这正是 D2 要标的坑。`);
   } else if (key === "r") {
     Object.assign(state, {
       running: false,
