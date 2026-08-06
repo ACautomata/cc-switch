@@ -23,7 +23,7 @@
 - **failover 钉死**：一段对话内，advisor 子调用钉死在本次 executor 实际命中的 Provider，不随每次调用重新走 router 选择。
 - **advisor 模型**：由客户端 advisor 工具块的 `model` 字段给出（见下方「配置建模」节）；后端走 `model_mapper` 分档映射，未配该档映射时回落到「沿用 executor 已映射好的那个模型」。~~（#6 原表述「用户显式设定 advisor 档位」已被 #8 更正为非用户配置）~~
 - **max_tokens 沿用 executor**：advisor 子调用的 `max_tokens` 直接沿用 executor 请求里的值。
-- **成本只记录不熔断**：advisor 的 token 计入 cc-switch 用量统计；不单独做硬熔断（端点健康由既有熔断器负责）。
+- **成本只记录不熔断**：advisor 的 token 计入 cc-switch 用量统计；不单独做硬熔断（端点健康由既有熔断器负责）。「按哪个维度建模」见下方「用量建模（非流式）」节（issue #14）。
 
 ### 触发时机（仅 Claude Code 场景）
 
@@ -43,3 +43,13 @@
 - **advisor 侧缓存开关**：暴露、默认开，子调用注入 `cache_control`；端点因 `cache_control` 报错则去掉缓存重试一次。
 - **回注协议偏好**：默认 `advisor_tool_result{content: advisor_result{text}}`；下游报错自动回退普通 `tool_result`；逐 Provider 留手动覆盖（供 #7 实测后标定）。
 - **配对校验**：只查物理硬约束「advisor 上下文窗 ≥ executor 完整转录长度」（`max_input_tokens` 可判）；能力配对交给用户，不做能力档启发式警告。
+
+### 用量建模（非流式，issue #14）
+
+本地 advisor 子调用自身消耗的 token 如何进 cc-switch 用量统计（只覆盖非流式；流式 `SseUsageCollector` 不在此范围）：
+
+- **独立 advisor 行**：advisor 是一次独立上游 `/v1/messages` 调用（不同 `message_id`、分档映射后常与 executor 不同 `model`），在 `proxy_request_logs` 里**独立一行**、**不并入** executor 顶层 `usage`——对应官方 `iterations[]` 的 `advisor_message`/`message` 分行语义。
+- **仅靠 `model` 列区分**：不引入 provider_id 命名空间、不新增 schema 列；advisor 的归属靠它实际命中的 `model` 体现。
+- **按实际命中模型计价**：advisor 行的 `model`/`request_model`/`pricing_model` 都写分档映射后实际命中的模型（费率可能不同于 executor），零额外处理。
+- **计入总用量总成本、不单独报表**：advisor 行落同一张表、按自身费率计价后自然计入 provider/全局总账（承接 #6「成本只记录不熔断」），不单列 advisor 成本项。
+- **去重/session 安全**：`request_id` 由 advisor 自身 `message_id` 派生，天然唯一；官方契约 executor 顶层 `usage` 本不含 advisor token，session 导入器不会与代理行双计。
