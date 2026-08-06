@@ -53,3 +53,10 @@
 - **按实际命中模型计价**：advisor 行的 `model`/`request_model`/`pricing_model` 都写分档映射后实际命中的模型（费率可能不同于 executor），零额外处理。
 - **计入总用量总成本、不单独报表**：advisor 行落同一张表、按自身费率计价后自然计入 provider/全局总账（承接 #6「成本只记录不熔断」），不单列 advisor 成本项。
 - **去重/session 安全**：`request_id` 由 advisor 自身 `message_id` 派生，天然唯一；官方契约 executor 顶层 `usage` 本不含 advisor token，session 导入器不会与代理行双计。
+
+### 错误降级（issue #16）
+
+- **失败不打断**：本地 advisor 子调用失败（限流 / 超时 / 超载 / 上下文超窗等）时，cc-switch **回注一个「advisor 本次无建议」的信号**让 executor 继续，**绝不整请求 5xx**（忠实官方「request itself does not fail」）。**不发 `max_uses_exceeded`**——`max_uses` 透传客户端、本地无服务端上限可触发。
+- **失败→错误码映射**（仅作内部日志/用量记录的分类归因 + 回注明文的「原因」用词）：429→`too_many_requests`、529/`overloaded`→`overloaded`、超时→`execution_time_exceeded`、400 超窗→`prompt_too_long`、其余一切→`unavailable`。
+- **错误形状**：复用原型 #7 的**普通 `tool_result` 明文回退**（与成功路径同一形状），`content` 明文写「advisor 不可用 + 原因」。六错误码**不作为结构化块 type 透给第三方端点**（第三方对 `advisor_tool_result` 未知块 400）；内联 `advisor_tool_result_error` 块仅作契约参照落 ADR-0003，不进生产回注体。
+- **流式保活（既定约束）**：流式路径在 advisor 推理暂停期需发 SSE `ping` 保活（承接 #5，`create_logged_passthrough_stream` 首字节/静默超时假设）。
