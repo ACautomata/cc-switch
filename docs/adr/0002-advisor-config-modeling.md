@@ -10,8 +10,10 @@
 base_url 主机名是 Claude 官方域（`api.anthropic.com` / `api.claude.com` 等）→ 关闭本地降级、原生 advisor 透传；**其余一律默认本地降级**。无手动覆盖开关、无错误指纹匹配。
 理由：「端点认不认识 advisor」的报错发生在 **executor 主请求**上，而本地降级要在主请求发出**之前**就改写好——等看到 400 时已牺牲一次请求；且「静默吞掉」型端点（OpenAI 兼容网关）对 advisor 块**返回 200 不报错**（`issue-4` F5/I3），try-catch 永远没有可 catch 的东西。base_url 恰好绕开这个死穴：不支持的端点主机名都不是官方域，默认即被降级，无需等任何信号。**配置上因此无需新增「是否支持 advisor」字段。**
 
-**2. `advisor_tier`：逐 Provider，放 `ProviderMeta`（默认 `fable`）。**
-理由：运行时 `advisor_tier` 经 `model_mapper` 映射成分档模型，而分档映射表（`ANTHROPIC_DEFAULT_{tier}_MODEL`）本就是逐 Provider 配的——`advisor_tier` 与它同生命周期、同住一处语义最贴；且逐 Provider 才能「弱端点配 sonnet 省钱 / 强端点配 fable 求质」，并支撑逐端点配对校验（题 5）。前端落在 `src/types.ts` 的 `ProviderMeta`（非 `proxy.ts`），表单为三档选择（fable/opus/sonnet）+ 默认 fable。
+**2. advisor 模型档位：由 Claude Code 客户端在工具块 `model` 字段给出，cc-switch 只后端映射——前端零配置。**
+**这不是 cc-switch 的用户配置项。** Claude Code 客户端发来的 advisor 工具块 `{type:"advisor_20260301", name:"advisor", model, ...}` 里，`model` 字段已给出 advisor 档位（fable/opus/sonnet 档名或具体模型 ID）。cc-switch 后端**被动读取该值**，走既有 `model_mapper` 分档映射成第三方模型；未配该档映射时回落 executor 已映射模型。**前端 `src/types.ts` / `proxy.ts` 零改动、零表单**。
+理由：「advisor 用哪档」是客户端的语义决定，cc-switch 作为代理不该替用户重选；复用既有 `model_mapper` 即可，无需新建配置。
+**更正**：此项**推翻了 #6 / ADR-0001** 中「用户显式设 `advisor_tier`（fable/opus/sonnet，默认 fable）落 `ProviderMeta`」的提法——`advisor_tier` 不是用户配置，而是客户端 `model` 字段的后端透传映射；「默认 fable」是 Claude Code 自己发的值，非 cc-switch 的默认。
 
 **3. advisor 侧 ephemeral 缓存：暴露开关、默认开；不支持则关掉重试。**
 advisor 子调用注入 `cache_control`。若端点因 `cache_control` 报错（400 之类），去掉缓存**重试一次**。理由：官方缓存作用于 advisor 侧（转录前缀稳定，≥3 次回本），值得默认开；但第三方端点对 `cache_control` 支持参差，报错时优雅回退而非整体失败。此处保留极窄 try-catch，与题 1「触发判定无指纹」不矛盾——触发仍纯靠 base_url，这里只是缓存优化失败时的回退。
@@ -25,7 +27,7 @@ advisor 子调用注入 `cache_control`。若端点因 `cache_control` 报错（
 ## 被否的替代方案
 
 - **默认支持 advisor（opt-out 声明）/ 运行时探测 / 错误指纹匹配**（题 1）：对「静默吞掉」型端点会静默失效或无信号可捕（`issue-4` I3/I5）。
-- **`advisor_tier` 放全局 proxy 配置 / 全局默认+端点覆盖**（题 2）：无法按端点调档、配对校验只能全局一个标准；两层配置心智成本高。
+- **把 advisor 档位建成 cc-switch 用户配置（`ProviderMeta.advisor_tier` 三档表单 / 全局配置）**（题 2）：「advisor 用哪档」是客户端语义决定，代理不该替用户重选；复用既有 `model_mapper` 后端映射即可，新建配置无收益且会覆盖客户端意图。
 - **不暴露缓存开关 / 默认关**（题 3）：放弃官方「前缀稳定、≥3 次回本」的收益。
 - **回注写死回退普通 `tool_result` / 纯手动开关无自动回退**（题 4）：前者丢官方块语义，后者把兼容负担全推给用户。
 - **能力档启发式警告 / 完全不校验**（题 5）：前者需自维护第三方模型能力序、有假阳性；后者把 `prompt_too_long` 直接甩给上游、体验差。
