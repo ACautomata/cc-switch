@@ -34,3 +34,12 @@
 ### 防重入
 
 - **不做防重入**：advisor 子调用的 `tools` 为空（含 Oracle 系统提示 + 完整转录，无 advisor 工具），递归前提不成立，无需 `is_advisor_subcall` 之类标记。
+
+### 配置建模（issue #8）
+
+- **官方端点判定**：是否走本地降级，纯按 base_url 启发式——base_url 主机名是 Claude 官方域（`api.anthropic.com` / `api.claude.com` 等）则关闭本地降级、原生 advisor 透传；其余一律默认本地降级。零配置、无手动覆盖、无错误指纹匹配。
+- **降级触发与报错判断的分界**：端点认不认识 advisor 的报错发生在 executor 主请求上、且本地降级要在主请求发出**之前**判定，「静默吞掉」型端点还返回 200 假成功——故触发判定不能靠 try-catch，只能用 base_url 先验。反之，**advisor 子调用 / 回注**是 cc-switch 自己发起或能直接观察响应的，这两处（缓存、回注块）才能用报错兜底。
+- **advisor 档位字段（advisor_tier）**：逐 Provider 配置，落 `ProviderMeta`（默认 `fable`），前端在 `src/types.ts` 的 `ProviderMeta` 加三档选择（fable/opus/sonnet）。
+- **advisor 侧缓存开关**：暴露、默认开，子调用注入 `cache_control`；端点因 `cache_control` 报错则去掉缓存重试一次。
+- **回注协议偏好**：默认 `advisor_tool_result{content: advisor_result{text}}`；下游报错自动回退普通 `tool_result`；逐 Provider 留手动覆盖（供 #7 实测后标定）。
+- **配对校验**：只查物理硬约束「advisor 上下文窗 ≥ executor 完整转录长度」（`max_input_tokens` 可判）；能力配对交给用户，不做能力档启发式警告。
