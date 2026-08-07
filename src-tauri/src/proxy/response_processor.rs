@@ -74,6 +74,42 @@ pub(crate) fn strip_entity_headers_for_rebuilt_body(headers: &mut HeaderMap) {
     headers.remove(axum::http::header::TRANSFER_ENCODING);
 }
 
+/// 用重建后的 JSON body 构建响应（保留干净的上游头、强制 JSON Content-Type）。
+///
+/// 供 `handle_claude_transform` 与 advisor 回路（`handlers.rs`）共用——两者
+/// 都在读完上游 body、序列化新 JSON body 后重建响应，避免逐处复制。
+pub(crate) fn build_json_response(
+    status: http::StatusCode,
+    mut headers: HeaderMap,
+    json_body: &Value,
+    tag: &str,
+) -> Result<Response, ProxyError> {
+    strip_entity_headers_for_rebuilt_body(&mut headers);
+    strip_hop_by_hop_response_headers(&mut headers);
+    // Builder::header 是 append 语义；不先 remove 会和上游 Content-Type 双发。
+    headers.remove(axum::http::header::CONTENT_TYPE);
+
+    let mut builder = Response::builder().status(status);
+    for (key, value) in headers.iter() {
+        builder = builder.header(key, value);
+    }
+    builder = builder.header(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+
+    let body_bytes = serde_json::to_vec(json_body)
+        .map_err(|e| ProxyError::TransformError(format!("Failed to serialize response: {e}")))?;
+    log::debug!("[{tag}] 重建 JSON 响应: status={}, bytes={}", status.as_u16(), body_bytes.len());
+
+    builder
+        .body(axum::body::Body::from(body_bytes))
+        .map_err(|e| {
+            log::error!("[{tag}] 构建响应失败: {e}");
+            ProxyError::Internal(format!("Failed to build response: {e}"))
+        })
+}
+
 /// 读取响应体并在需要时解压，确保 headers 与返回 body 一致。
 ///
 /// `body_timeout`: 整包超时。当非零时用 `tokio::time::timeout` 包住 `.bytes()` 调用，
