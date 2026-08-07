@@ -195,15 +195,57 @@ async fn handle_messages_for_app(
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
 
+    // 检查是否需要格式转换（OpenRouter 等中转服务）。提前到这里计算：
+    // 决定 advisor 块是否剥离（格式转换端点走 handle_claude_transform、
+    // 回路无法介入，不剥块）。
+    let adapter = get_adapter(&app_type);
+    let needs_transform = adapter.needs_transform(&ctx.provider);
+
+    // advisor 本地降级（issue #20）：非官方端点 + 非流式请求时，剥离
+    // `advisor_20260301` server-tool 块、替换为普通客户端工具 `advisor`，
+    // 并按值剥 `advisor-tool-2026-03-01` beta 头（官方域原样透传）。
+    //
+    // 仅限纯 Anthropic 透传端点（!needs_transform）：格式转换端点
+    // （OpenRouter Chat/Responses、Gemini Native 等）走 `handle_claude_transform`
+    // 响应转换，回路无法介入——此时不剥块（上游不认识 advisor 块时报错由
+    // 既有整流/错误路径处理），避免「剥了块却无人捕获 tool_use」让 executor 卡住。
+    let mut advisor_capture = None;
+    let mut forward_body = body.clone();
+    let mut forward_headers = headers.clone();
+    // 回路（子调用/续跑）需要原始头大小写信息（OriginalHeaderCases），
+    // 首轮 forward 会消费 extensions，这里提前 clone 一份。
+    let advisor_extensions = extensions.clone();
+    let advisor_verdict = super::advisor::provider_base_url(&ctx.provider)
+        .map(|url| super::advisor::is_official_anthropic_base_url(&url))
+        .unwrap_or(super::advisor::AdvisorEndpointVerdict::ThirdParty);
+    // 判定基于请求发出前的首个候选 provider（ADR-0002「base_url 先验」：
+    // 降级必须在主请求发出之前判定，无法先知 failover 后实际命中的端点）。
+    // failover 链通常同类端点（均为第三方中转），官方端点不在此链。
+    if !is_stream
+        && advisor_verdict == super::advisor::AdvisorEndpointVerdict::ThirdParty
+        && ctx.app_type == AppType::Claude
+        && !needs_transform
+    {
+        let rewrite = super::advisor::rewrite_advisor_request(&body);
+        if rewrite.rewritten {
+            log::debug!(
+                "[Advisor] 非官方端点，剥离 server-tool 并注入客户端 advisor 工具（beta 头按值剥离）"
+            );
+            advisor_capture = Some(rewrite.capture);
+            forward_body = rewrite.body;
+            super::advisor::strip_advisor_beta_header(&mut forward_headers);
+        }
+    }
+
     // 转发请求
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
         .forward_with_retry(
             &app_type,
-            method,
+            method.clone(),
             endpoint,
-            body.clone(),
-            headers,
+            forward_body.clone(),
+            forward_headers.clone(),
             extensions,
             ctx.get_providers(),
         )
@@ -229,10 +271,6 @@ async fn handle_messages_for_app(
         .to_string();
     let response = result.response;
 
-    // 检查是否需要格式转换（OpenRouter 等中转服务）
-    let adapter = get_adapter(&app_type);
-    let needs_transform = adapter.needs_transform(&ctx.provider);
-
     // Claude 特有：格式转换处理
     if needs_transform {
         return handle_claude_transform(
@@ -248,14 +286,78 @@ async fn handle_messages_for_app(
     }
 
     // 通用响应处理（透传模式）
-    process_response(
-        response,
-        &ctx,
-        &state,
-        &CLAUDE_PARSER_CONFIG,
-        connection_guard,
-    )
-    .await
+    if let Some(capture) = advisor_capture {
+        // advisor 降级回路：仅当非流式、非 SSE 且无需格式转换时尝试。
+        // 流式路径由切片 6 承接。
+        // 注意 is_sse() 守卫并非冗余：部分网关对 stream:false 也返回 SSE
+        // （#2234 兜底嗅探场景），回路内部按 JSON 读 body，SSE 会解析失败——
+        // 先按响应头排除，让这类响应走既有透传流程。
+        if !is_stream && !response.is_sse() && !needs_transform {
+            log::debug!("[Advisor] 进入降级回路（非流式透传路径）");
+            let forwarder2 = ctx.create_forwarder(&state);
+            match super::advisor::run_advisor_loop(
+                &ctx,
+                &forwarder2,
+                method,
+                endpoint,
+                forward_headers,
+                advisor_extensions,
+                &forward_body,
+                capture,
+                response,
+            )
+            .await?
+            {
+                super::advisor::AdvisorLoopOutcome::NoAdvisorCall { response } => {
+                    // 无 advisor 调用：走正常透传流程
+                    process_response(
+                        response,
+                        &ctx,
+                        &state,
+                        &CLAUDE_PARSER_CONFIG,
+                        connection_guard,
+                    )
+                    .await
+                }
+                super::advisor::AdvisorLoopOutcome::Completed {
+                    headers: headers_out,
+                    status: status_out,
+                    body: final_body,
+                } => {
+                    // usage 落库（executor 最终响应；切片 5 会补充 advisor 行）
+                    if usage_logging_enabled(&state) {
+                        spawn_claude_usage_log(&state, &ctx, &final_body, status_out.as_u16(), false);
+                    }
+
+                    // 构建响应（共享 helper：剥实体头 + 强制 JSON Content-Type）
+                    super::response_processor::build_json_response(
+                        status_out,
+                        headers_out,
+                        &final_body,
+                        "Advisor",
+                    )
+                }
+            }
+        } else {
+            process_response(
+                response,
+                &ctx,
+                &state,
+                &CLAUDE_PARSER_CONFIG,
+                connection_guard,
+            )
+            .await
+        }
+    } else {
+        process_response(
+            response,
+            &ctx,
+            &state,
+            &CLAUDE_PARSER_CONFIG,
+            connection_guard,
+        )
+        .await
+    }
 }
 
 fn validate_claude_desktop_gateway_auth(
@@ -520,7 +622,7 @@ async fn handle_claude_transform(
         } else {
             std::time::Duration::ZERO
         };
-    let (mut response_headers, _status, body_bytes) =
+    let (response_headers, _status, body_bytes) =
         read_decoded_body(response, ctx.tag, body_timeout).await?;
 
     let body_str = String::from_utf8_lossy(&body_bytes);
@@ -617,32 +719,13 @@ async fn handle_claude_transform(
     // 在上游缺 stream_options.include_usage 时没有 usage，写入只会产生无意义空行
     spawn_claude_usage_log(state, ctx, &anthropic_response, status.as_u16(), false);
 
-    // 构建响应
-    let mut builder = axum::response::Response::builder().status(status);
-    strip_entity_headers_for_rebuilt_body(&mut response_headers);
-    strip_hop_by_hop_response_headers(&mut response_headers);
-    // Builder::header 是 append 语义；不先 remove 会和上游 Content-Type 双发。
-    response_headers.remove(axum::http::header::CONTENT_TYPE);
-
-    for (key, value) in response_headers.iter() {
-        builder = builder.header(key, value);
-    }
-
-    builder = builder.header(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/json"),
-    );
-
-    let response_body = serde_json::to_vec(&anthropic_response).map_err(|e| {
-        log::error!("[Claude] 序列化响应失败: {e}");
-        ProxyError::TransformError(format!("Failed to serialize response: {e}"))
-    })?;
-
-    let body = axum::body::Body::from(response_body);
-    builder.body(body).map_err(|e| {
-        log::error!("[Claude] 构建响应失败: {e}");
-        ProxyError::Internal(format!("Failed to build response: {e}"))
-    })
+    // 构建响应（共享 helper：剥实体头 + 强制 JSON Content-Type）
+    super::response_processor::build_json_response(
+        status,
+        response_headers,
+        &anthropic_response,
+        "Claude",
+    )
 }
 
 fn endpoint_with_query(uri: &axum::http::Uri, endpoint: &str) -> String {
