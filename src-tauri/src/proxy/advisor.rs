@@ -150,13 +150,15 @@ pub fn rewrite_advisor_request(body: &Value) -> AdvisorRequestRewrite {
         };
     }
 
-    // 替换为普通客户端工具（function tool、无参数），追加到末尾，
+    // 替换为普通客户端工具（无参数），追加到末尾，
     // 保持其余工具的相对顺序不变。
+    // 形状对齐 wire contract（docs/research/issue-5-advisor-client-shape.md:216-223）：
+    // Anthropic 自定义工具仅 name/description/input_schema，不带 OpenAI 包装的
+    // `type: "function"` 字段（严格网关会因该未知字段拒绝请求）。
     // 描述只说明工具「做什么」（咨询强模型、返回建议），不注入「何时调用」
     // 的引导——客户端已注入（CONTEXT.md「触发时机」；重复注入破坏 prompt
     // cache 前缀）。
     remaining.push(json!({
-        "type": "function",
         "name": ADVISOR_TOOL_NAME,
         "description": "Consults a stronger reviewer model that sees your full transcript and returns expert advice.",
         "input_schema": { "type": "object", "properties": {}, "required": [] }
@@ -431,6 +433,19 @@ pub fn should_continue_with_advisor(response: &Value) -> bool {
     find_advisor_tool_use(response).is_some()
 }
 
+/// 续跑错误处置决策（同步纯函数）：下游对 `advisor_tool_result` 未知块返回
+/// HTTP 400 时，回退普通 `tool_result` 重试一次（ADR-0002 题 4，原型 #7 实测必须
+/// 回退）；其余错误（429 限流 / 401 鉴权 / 5xx / 网络等）不是块形状问题，重试
+/// 无意义，直接透传给客户端。
+///
+/// 注意判定的载体：`forward` 把一切非 2xx 统一转成 `Err(UpstreamError)`
+/// （forwarder.rs 错误单一出口），故 400 只能出现在 `Err` 里、永远不会以 `Ok`
+/// 响应的 status 出现——此前误用 `continued_response.status() == BAD_REQUEST`
+/// 判定，使回退分支不可达（review #27）。
+pub fn continuation_needs_tool_result_fallback(err: &ProxyError) -> bool {
+    matches!(err, ProxyError::UpstreamError { status: 400, .. })
+}
+
 /// 从 Provider 配置读取 base_url。
 ///
 /// 注意：与 `ClaudeAdapter::extract_base_url`（providers/claude.rs）读取顺序
@@ -675,9 +690,19 @@ pub async fn run_advisor_loop(
             });
         }
 
-        let response_json: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
-            ProxyError::TransformError(format!("executor 响应解析失败: {e}"))
-        })?;
+        // 执行器响应体非 JSON（如网关对 stream:false 误回了无 SSE content-type 的
+        // SSE 体——`is_sse()` 只看响应头，盖不住这种错标 body）：无法据此判定 advisor
+        // `tool_use`，按 `AdvisorLoopOutcome::NoAdvisorCall` 语义重建 buffered 响应
+        // 走正常透传，而非把上游响应替换成 TransformError（regression，review #27）。
+        let response_json: Value = match serde_json::from_slice(&body_bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                log::debug!("[Advisor] 执行器响应体非 JSON，按正常透传处理");
+                return Ok(AdvisorLoopOutcome::NoAdvisorCall {
+                    response: ProxyResponse::buffered(status, response_headers, body_bytes),
+                });
+            }
+        };
 
         // 续跑决策：响应中是否还有 advisor 调用需要处理（spec 验收标准点名的
         // 纯函数；循环用它判定是否结束）。
@@ -735,13 +760,15 @@ pub async fn run_advisor_loop(
             "content": [injection]
         });
 
-        // 续跑（钉死同一 provider）
+        // 续跑（钉死同一 provider）。`forward` 把一切非 2xx 转成 `Err(UpstreamError)`
+        // （forwarder.rs 错误单一出口），故 400 只能在 `Err` 里识别、不会以 `Ok` 响应
+        // 的 status 出现——改用 `continuation_needs_tool_result_fallback` 判定。
         let continued_body = build_continuation_request(
             &current_body,
             &assistant_message,
             &injection_message,
         );
-        let (continued_response, _pid, _model, _ext) = forward_once(
+        match forward_once(
             forwarder,
             &ctx.app_type,
             method.clone(),
@@ -752,42 +779,46 @@ pub async fn run_advisor_loop(
             &ctx.provider,
             false,
         )
-        .await?;
-
-        // 续跑遇 400（下游不认 advisor_tool_result 未知块，ADR-0002 题 4）
-        // → 回退普通 tool_result 重试一次。其他 4xx（429 限流 / 401 鉴权 /
-        // 404 等）不是块形状问题，重试无意义，直接透传给客户端。
-        if continued_response.status() == http::StatusCode::BAD_REQUEST {
-            log::warn!("[Advisor] 续跑遇下游 4xx，回退普通 tool_result 重试");
-            let fallback_injection = build_tool_result_injection(&tool_use_id, &advice_text);
-            let fallback_message = json!({
-                "role": "user",
-                "content": [fallback_injection]
-            });
-            let fallback_body = build_continuation_request(
-                &current_body,
-                &assistant_message,
-                &fallback_message,
-            );
-            let (fallback_response, _pid, _model, _ext) = forward_once(
-                forwarder,
-                &ctx.app_type,
-                method.clone(),
-                endpoint,
-                fallback_body.clone(),
-                headers.clone(),
-                extensions.clone(),
-                &ctx.provider,
-                false,
-            )
-            .await?;
-            response = fallback_response;
-            // 实际发出的是 tool_result 回注版，转录随之更新
-            current_body = fallback_body;
-        } else {
-            response = continued_response;
-            // 实际发出的是 advisor_tool_result 回注版，转录随之更新
-            current_body = continued_body;
+        .await
+        {
+            Ok((continued_response, _pid, _model, _ext)) => {
+                response = continued_response;
+                // 实际发出的是 advisor_tool_result 回注版，转录随之更新
+                current_body = continued_body;
+            }
+            Err(e) if continuation_needs_tool_result_fallback(&e) => {
+                // 续跑遇 400（下游不认 advisor_tool_result 未知块，ADR-0002 题 4）
+                // → 回退普通 tool_result 重试一次；回退再失败则透传给客户端。
+                log::warn!("[Advisor] 续跑遇下游 400（advisor_tool_result 未知块），回退普通 tool_result 重试");
+                let fallback_injection = build_tool_result_injection(&tool_use_id, &advice_text);
+                let fallback_message = json!({
+                    "role": "user",
+                    "content": [fallback_injection]
+                });
+                let fallback_body = build_continuation_request(
+                    &current_body,
+                    &assistant_message,
+                    &fallback_message,
+                );
+                let (fallback_response, _pid, _model, _ext) = forward_once(
+                    forwarder,
+                    &ctx.app_type,
+                    method.clone(),
+                    endpoint,
+                    fallback_body.clone(),
+                    headers.clone(),
+                    extensions.clone(),
+                    &ctx.provider,
+                    false,
+                )
+                .await?;
+                response = fallback_response;
+                // 实际发出的是 tool_result 回注版，转录随之更新
+                current_body = fallback_body;
+            }
+            // 其他 4xx（429 限流 / 401 鉴权 / 404 等）与 5xx / 网络错误不是块形状
+            // 问题，重试无意义，直接透传给客户端。
+            Err(e) => return Err(e),
         }
     }
 
@@ -902,7 +933,15 @@ mod tests {
         assert_eq!(tools.len(), 2, "server tool replaced by client tool, custom kept");
         assert!(tools.iter().all(|t| t.get("type").and_then(Value::as_str) != Some("advisor_20260301")));
         let advisor_tool = tools.iter().find(|t| t.get("name").and_then(Value::as_str) == Some("advisor")).unwrap();
-        assert_eq!(advisor_tool.get("type").and_then(Value::as_str), Some("function"));
+        // 对齐 wire contract（docs/research/issue-5-advisor-client-shape.md:216-223）：
+        // Anthropic 自定义工具仅 name/description/input_schema，**不带** OpenAI 包装
+        // 形状的 `type: "function"` 字段——严格网关会因该未知字段拒绝请求（review #27）。
+        assert!(
+            advisor_tool.get("type").is_none(),
+            "Anthropic 自定义工具不应携带 type 字段，实际: {:?}",
+            advisor_tool.get("type")
+        );
+        assert!(advisor_tool.get("description").and_then(Value::as_str).is_some());
         assert_eq!(
             advisor_tool.pointer("/input_schema/properties"),
             Some(&json!({}))
@@ -1102,6 +1141,30 @@ mod tests {
         });
         assert!(should_continue_with_advisor(&response));
         assert!(!should_continue_with_advisor(&json!({"content": [{"type": "text", "text": "done"}]})));
+    }
+
+    #[test]
+    fn continuation_fallback_only_on_http_400() {
+        // 下游 400（advisor_tool_result 未知块）→ 回退普通 tool_result
+        assert!(continuation_needs_tool_result_fallback(&ProxyError::UpstreamError {
+            status: 400,
+            body: None,
+        }));
+        // 其余 4xx / 5xx / 网络错误不重试，直接透传
+        for err in [
+            ProxyError::UpstreamError { status: 401, body: None },
+            ProxyError::UpstreamError { status: 404, body: None },
+            ProxyError::UpstreamError { status: 429, body: None },
+            ProxyError::UpstreamError { status: 500, body: None },
+            ProxyError::UpstreamError { status: 529, body: None },
+            ProxyError::Timeout("t".to_string()),
+            ProxyError::ForwardFailed("f".to_string()),
+        ] {
+            assert!(
+                !continuation_needs_tool_result_fallback(&err),
+                "不应回退: {err:?}"
+            );
+        }
     }
 
     // ── base_url 读取 ──

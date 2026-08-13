@@ -195,11 +195,13 @@ async fn handle_messages_for_app(
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
 
-    // 检查是否需要格式转换（OpenRouter 等中转服务）。提前到这里计算：
-    // 决定 advisor 块是否剥离（格式转换端点走 handle_claude_transform、
-    // 回路无法介入，不剥块）。
+    // 检查是否需要格式转换（OpenRouter 等中转服务）。这里基于**请求发出前的首个
+    // 候选 provider** 先算一次，仅用于「advisor 块是否剥离」这一必须在 forward 之前
+    // 定稿的决策（格式转换端点走 handle_claude_transform、回路无法介入，不剥块）。
+    // 响应侧是否转换必须在 forward 之后按实际命中的 provider 重算（见下文
+    // `needs_transform`），否则 failover 到异构 provider 时会用错格式（review #27）。
     let adapter = get_adapter(&app_type);
-    let needs_transform = adapter.needs_transform(&ctx.provider);
+    let needs_transform_before_forward = adapter.needs_transform(&ctx.provider);
 
     // advisor 本地降级（issue #20）：非官方端点 + 非流式请求时，剥离
     // `advisor_20260301` server-tool 块、替换为普通客户端工具 `advisor`，
@@ -224,7 +226,7 @@ async fn handle_messages_for_app(
     if !is_stream
         && advisor_verdict == super::advisor::AdvisorEndpointVerdict::ThirdParty
         && ctx.app_type == AppType::Claude
-        && !needs_transform
+        && !needs_transform_before_forward
     {
         let rewrite = super::advisor::rewrite_advisor_request(&body);
         if rewrite.rewritten {
@@ -264,6 +266,10 @@ async fn handle_messages_for_app(
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
+    // failover 可能命中与首个候选不同 api_format 的 provider，响应侧是否格式转换必须
+    // 按实际命中的 provider 重算（此前沿用了 forward 前基于首个候选的旧值，异构
+    // provider 的响应会被错误透传/转换；该 regression 影响所有 Claude 请求，review #27）。
+    let needs_transform = adapter.needs_transform(&ctx.provider);
     let api_format = result
         .claude_api_format
         .as_deref()
@@ -294,7 +300,10 @@ async fn handle_messages_for_app(
         // 先按响应头排除，让这类响应走既有透传流程。
         if !is_stream && !response.is_sse() && !needs_transform {
             log::debug!("[Advisor] 进入降级回路（非流式透传路径）");
-            let forwarder2 = ctx.create_forwarder(&state);
+            // 回路的子调用/续跑是同一入站请求衍生的内部上游调用，用隔离 status 的
+            // forwarder——不计入客户端请求维度的 total/success/failed/success_rate
+            // （review #27）；熔断/路由仍走共享 router，行为不变。
+            let forwarder2 = ctx.create_forwarder(&state).with_isolated_status();
             match super::advisor::run_advisor_loop(
                 &ctx,
                 &forwarder2,

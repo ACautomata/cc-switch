@@ -239,6 +239,35 @@ impl RequestForwarder {
         }
     }
 
+    /// 派生一个用于代理内部回路（如 advisor 子调用/续跑）的 forwarder。
+    ///
+    /// 共享 router（熔断/路由）、failover_manager 等全部依赖，仅把 `status` 换成一份
+    /// 全新的隔离实例：内部调用是**同一入站请求衍生**的上游调用，其成功/失败/计数
+    /// 不应进入面向用户的客户端请求指标（`total_requests`/`success_requests`/
+    /// `failed_requests`/`success_rate`）——否则一次入站会被内部回路放大成多次、
+    /// 内部失败还会拉低成功率（review #27）。熔断器结果仍写入共享 router，
+    /// 路由/熔断行为不变。
+    pub fn with_isolated_status(&self) -> Self {
+        Self {
+            router: self.router.clone(),
+            status: Arc::new(RwLock::new(ProxyStatus::default())),
+            current_providers: self.current_providers.clone(),
+            gemini_shadow: self.gemini_shadow.clone(),
+            codex_chat_history: self.codex_chat_history.clone(),
+            failover_manager: self.failover_manager.clone(),
+            app_handle: self.app_handle.clone(),
+            current_provider_id_at_start: self.current_provider_id_at_start.clone(),
+            session_id: self.session_id.clone(),
+            session_client_provided: self.session_client_provided,
+            rectifier_config: self.rectifier_config.clone(),
+            optimizer_config: self.optimizer_config.clone(),
+            copilot_optimizer_config: self.copilot_optimizer_config.clone(),
+            non_streaming_timeout: self.non_streaming_timeout,
+            streaming_first_byte_timeout: self.streaming_first_byte_timeout,
+            max_attempts: self.max_attempts,
+        }
+    }
+
     async fn record_success_result(
         &self,
         provider_id: &str,
@@ -3621,11 +3650,24 @@ mod tests {
         non_streaming_timeout: Duration,
         streaming_first_byte_timeout: Duration,
     ) -> RequestForwarder {
+        test_forwarder_with_status(
+            Arc::new(RwLock::new(ProxyStatus::default())),
+            non_streaming_timeout,
+            streaming_first_byte_timeout,
+        )
+    }
+
+    /// 与 `test_forwarder` 相同，但使用调用方持有的 `status`，便于断言客户端请求指标。
+    fn test_forwarder_with_status(
+        status: Arc<RwLock<ProxyStatus>>,
+        non_streaming_timeout: Duration,
+        streaming_first_byte_timeout: Duration,
+    ) -> RequestForwarder {
         let db = Arc::new(Database::memory().expect("memory db"));
 
         RequestForwarder {
             router: Arc::new(ProviderRouter::new(db.clone())),
-            status: Arc::new(RwLock::new(ProxyStatus::default())),
+            status,
             current_providers: Arc::new(RwLock::new(HashMap::new())),
             gemini_shadow: Arc::new(GeminiShadowStore::new()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
@@ -3641,6 +3683,48 @@ mod tests {
             streaming_first_byte_timeout,
             max_attempts: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn isolated_status_forwarder_skips_client_request_counters() {
+        // 客户端请求维度的 status：正常 forward 会把 total_requests +1。
+        // （空 providers 立即返回 Err、不发网络，但 wrapper 已在入口 +1。）
+        let status = Arc::new(RwLock::new(ProxyStatus::default()));
+        let forwarder =
+            test_forwarder_with_status(status.clone(), Duration::from_secs(1), Duration::from_secs(1));
+
+        let _ = forwarder
+            .forward_with_retry(
+                &AppType::Claude,
+                http::Method::POST,
+                "/v1/messages",
+                serde_json::json!({}),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![],
+            )
+            .await;
+        assert_eq!(status.read().await.total_requests, 1, "正常路径应记一次客户端请求");
+
+        // 内部回路（advisor 子调用/续跑）用隔离 status 的 forwarder：
+        // 不应把同一入站请求衍生的内部调用计入客户端请求指标（review #27）。
+        let isolated = forwarder.with_isolated_status();
+        let _ = isolated
+            .forward_with_retry(
+                &AppType::Claude,
+                http::Method::POST,
+                "/v1/messages",
+                serde_json::json!({}),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![],
+            )
+            .await;
+        assert_eq!(
+            status.read().await.total_requests,
+            1,
+            "隔离 status 的内部调用不得触碰客户端请求计数"
+        );
     }
 
     #[test]
