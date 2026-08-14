@@ -293,12 +293,12 @@ async fn handle_messages_for_app(
 
     // 通用响应处理（透传模式）
     if let Some(capture) = advisor_capture {
-        // advisor 降级回路：仅当非流式、非 SSE 且无需格式转换时尝试。
-        // 流式路径由切片 6 承接。
-        // 注意 is_sse() 守卫并非冗余：部分网关对 stream:false 也返回 SSE
-        // （#2234 兜底嗅探场景），回路内部按 JSON 读 body，SSE 会解析失败——
-        // 先按响应头排除，让这类响应走既有透传流程。
-        if !is_stream && !response.is_sse() && !needs_transform {
+        // advisor 降级回路：非流式透传路径。流式请求由切片 6 承接。
+        // 响应**不**按 `is_sse()` 头排除（review #27 F16）：改写已发生（请求注入
+        // 了合成客户端工具），若把带 SSE 头的响应挡在回路外原样透传，流里 executor
+        // 对合成工具的 `tool_use` 会直接到达客户端（其工具注册表没有 `advisor`），
+        // turn 卡死——改为进回路，由回路读 body 后嗅探聚合（#2234 兜底哲学）。
+        if !is_stream && !needs_transform {
             log::debug!("[Advisor] 进入降级回路（非流式透传路径）");
             // 回路的子调用/续跑是同一入站请求衍生的内部上游调用，用隔离 status 的
             // forwarder——不计入客户端请求维度的 total/success/failed/success_rate
@@ -2222,7 +2222,7 @@ fn responses_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
 /// 仅在 JSON 解析已失败后调用：合法 JSON 不可能以这些前缀开头，误判面为零。
 /// 覆盖 SSE 规范的全部四种字段行；包含 ":" 是因为 OpenRouter 等会在流前发
 /// `: PROCESSING` 注释行。
-fn body_looks_like_sse(body: &str) -> bool {
+pub(crate) fn body_looks_like_sse(body: &str) -> bool {
     let trimmed = body.trim_start_matches('\u{feff}').trim_start();
     ["data:", "event:", "id:", "retry:", ":"]
         .iter()
@@ -2611,6 +2611,179 @@ fn chat_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
     Ok(response)
 }
 
+/// 把 Anthropic Messages 流式 SSE 聚合为单个 message JSON（#2234 兜底哲学在
+/// 纯 Anthropic 透传路径的对应件，advisor 回路专用）。
+///
+/// 场景：advisor 改写已发生（请求注入了合成客户端工具 `advisor`）后，网关对
+/// stream:false 的请求返回了 SSE 体——`is_sse()` 只认 Content-Type，盖不住
+/// 错标体；若按原样透传，流里 executor 对合成工具的 `tool_use` 会直接到达
+/// 客户端（其工具注册表没有 `advisor`），turn 卡死（review #27 F16）。聚合成
+/// Messages JSON 后，回路按既有逻辑判定/消费 advisor `tool_use`，客户端拿到
+/// 的仍是合法 JSON，非流语义不变。
+///
+/// 事件类型以 data JSON 的 `type` 字段为准（部分网关省略 `event:` 行）。
+/// 完成性守卫对齐 `chat_sse_to_response_value`：缺 `message_start`（非
+/// Anthropic 流）或疑似截断（无 `message_stop` 且无 `stop_reason`）按错误
+/// 处理，不包装空内容假成功。
+pub(crate) fn anthropic_sse_to_message_value(body: &str) -> Result<Value, ProxyError> {
+    let mut buffer = body.trim_start_matches('\u{feff}').to_string();
+
+    let mut message: Option<Value> = None;
+    // 块按 index 聚合（BTreeMap 保序；index 由上游控制，map 不 densify——
+    // 对齐 chat 聚合器 C1 的考量）
+    let mut blocks: std::collections::BTreeMap<usize, Value> = std::collections::BTreeMap::new();
+    // tool_use 块的 input 由 input_json_delta.partial_json 字符串拼接，
+    // content_block_stop 时整体 parse
+    let mut input_json: std::collections::BTreeMap<usize, String> =
+        std::collections::BTreeMap::new();
+    let mut stop_reason = Value::Null;
+    let mut stop_sequence = Value::Null;
+    let mut usage = Value::Null;
+    let mut saw_message_stop = false;
+
+    let mut process_event = |data_str: &str| -> Result<(), ProxyError> {
+        let trimmed = data_str.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let chunk: Value = match serde_json::from_str(data_str) {
+            Ok(v) => v,
+            // 尾块等半截 JSON：忽略而非报错（对齐 chat 聚合器 C2 的宽容——
+            // 被掐断的尾块不应把已聚合完整的响应误杀）
+            Err(_) => return Ok(()),
+        };
+        let event_index = || chunk.get("index").and_then(Value::as_u64);
+        match chunk.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                if let Some(m) = chunk.get("message") {
+                    message = Some(m.clone());
+                }
+            }
+            Some("content_block_start") => {
+                if let (Some(index), Some(block)) = (event_index(), chunk.get("content_block")) {
+                    blocks.insert(index as usize, block.clone());
+                }
+            }
+            Some("content_block_delta") => {
+                let Some(index) = event_index() else {
+                    return Ok(());
+                };
+                let (Some(block), Some(delta)) =
+                    (blocks.get_mut(&(index as usize)), chunk.get("delta"))
+                else {
+                    return Ok(());
+                };
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                            let existing = block.get("text").and_then(Value::as_str).unwrap_or("");
+                            block["text"] = json!(format!("{existing}{text}"));
+                        }
+                    }
+                    Some("thinking_delta") => {
+                        if let Some(t) = delta.get("thinking").and_then(Value::as_str) {
+                            let existing =
+                                block.get("thinking").and_then(Value::as_str).unwrap_or("");
+                            block["thinking"] = json!(format!("{existing}{t}"));
+                        }
+                    }
+                    Some("signature_delta") => {
+                        if let Some(s) = delta.get("signature").and_then(Value::as_str) {
+                            let existing =
+                                block.get("signature").and_then(Value::as_str).unwrap_or("");
+                            block["signature"] = json!(format!("{existing}{s}"));
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
+                            input_json
+                                .entry(index as usize)
+                                .or_default()
+                                .push_str(partial);
+                        }
+                    }
+                    // citations_delta 等暂不聚合（回路只消费 text/thinking/tool_use）
+                    _ => {}
+                }
+            }
+            Some("content_block_stop") => {
+                if let Some(index) = event_index() {
+                    if let Some(json_str) = input_json.remove(&(index as usize)) {
+                        if let Some(block) = blocks.get_mut(&(index as usize)) {
+                            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                                // parse 失败保留空对象：宁丢参数不丢块（块的 id/name
+                                // 仍在，回注配对不受影响）
+                                let parsed: Value =
+                                    serde_json::from_str(&json_str).unwrap_or(json!({}));
+                                block["input"] = parsed;
+                            }
+                        }
+                    }
+                }
+            }
+            Some("message_delta") => {
+                if let Some(delta) = chunk.get("delta") {
+                    if let Some(sr) = delta.get("stop_reason").filter(|v| !v.is_null()) {
+                        stop_reason = sr.clone();
+                    }
+                    if let Some(ss) = delta.get("stop_sequence") {
+                        stop_sequence = ss.clone();
+                    }
+                }
+                if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
+                    usage = u.clone();
+                }
+            }
+            Some("message_stop") => {
+                saw_message_stop = true;
+            }
+            Some("ping") => {}
+            Some("error") => {
+                let msg = chunk
+                    .get("error")
+                    .and_then(error_event_message)
+                    .unwrap_or_else(|| "upstream error event in SSE stream".to_string());
+                return Err(ProxyError::TransformError(msg));
+            }
+            _ => {}
+        }
+        Ok(())
+    };
+
+    while let Some(block) = take_sse_block(&mut buffer) {
+        if let Some((_event, data)) = sse_block_parts(&block) {
+            process_event(&data)?;
+        }
+    }
+    // 尾块可能没有空行收尾（半截流/非规范上游）：残余 buffer 当最后一块处理，
+    // 内部对非 JSON 宽容
+    if let Some((_event, data)) = sse_block_parts(&buffer) {
+        process_event(&data)?;
+    }
+
+    let Some(mut message) = message else {
+        return Err(ProxyError::TransformError(
+            "No message_start in upstream SSE".to_string(),
+        ));
+    };
+    if !saw_message_stop && stop_reason.is_null() {
+        return Err(ProxyError::TransformError(
+            "Upstream SSE stream appears truncated (no message_stop or stop_reason)".to_string(),
+        ));
+    }
+    message["content"] = Value::Array(blocks.into_values().collect());
+    if !stop_reason.is_null() {
+        message["stop_reason"] = stop_reason;
+    }
+    if !stop_sequence.is_null() {
+        message["stop_sequence"] = stop_sequence;
+    }
+    if !usage.is_null() {
+        message["usage"] = usage;
+    }
+    Ok(message)
+}
+
 /// envelope 字段是否"有意义"：过滤 null、空串与数值 0（含浮点 0.0——Azure
 /// content-filter 前置块的占位值），避免占位值抢先冻结 id/model/created。
 fn envelope_value_meaningful(v: &Value) -> bool {
@@ -2776,6 +2949,7 @@ mod tests {
         should_use_claude_transform_streaming, transform, upstream_body_parse_error,
     };
     use crate::proxy::ProxyError;
+    use serde_json::json;
 
     #[test]
     fn body_looks_like_sse_detects_unlabeled_sse_prefixes() {
@@ -3453,5 +3627,158 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
         assert_eq!(body["error"]["provider"], "HCAI");
         assert_eq!(body["error"]["model"], "gpt-5.5");
         assert_eq!(body["error"]["endpoint"], "/responses");
+    }
+
+    // ── Anthropic SSE 聚合（advisor 回路兜底，#2234 哲学对应件，review #27 F16/F17）──
+
+    /// 把事件序列打包成 SSE 文本（每事件 `event:` + `data:` 行）。
+    fn anthropic_sse(events: &[serde_json::Value]) -> String {
+        let mut body = String::new();
+        for event in events {
+            body.push_str(&format!(
+                "event: {}\ndata: {}\n\n",
+                event["type"].as_str().unwrap_or_default(),
+                event
+            ));
+        }
+        body
+    }
+
+    #[test]
+    fn anthropic_sse_to_message_value_aggregates_full_stream() {
+        let sse = anthropic_sse(&[
+            json!({"type":"message_start","message":{
+                "id":"msg_1","type":"message","role":"assistant","model":"claude-x",
+                "content":[],"stop_reason":null,
+                "usage":{"input_tokens":10,"output_tokens":1}
+            }}),
+            json!({"type":"content_block_start","index":0,
+                   "content_block":{"type":"text","text":""}}),
+            json!({"type":"ping"}),
+            json!({"type":"content_block_delta","index":0,
+                   "delta":{"type":"text_delta","text":"Hello "}}),
+            json!({"type":"content_block_delta","index":0,
+                   "delta":{"type":"text_delta","text":"world"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,
+                   "content_block":{"type":"tool_use","id":"toolu_1","name":"advisor","input":{}}}),
+            json!({"type":"content_block_delta","index":1,
+                   "delta":{"type":"input_json_delta","partial_json":"{\"fo"}}),
+            json!({"type":"content_block_delta","index":1,
+                   "delta":{"type":"input_json_delta","partial_json":"cus\":true}"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_delta",
+                   "delta":{"stop_reason":"tool_use","stop_sequence":null},
+                   "usage":{"output_tokens":42}}),
+            json!({"type":"message_stop"}),
+        ]);
+        let message = super::anthropic_sse_to_message_value(&sse).unwrap();
+        assert_eq!(message["id"], "msg_1");
+        assert_eq!(message["role"], "assistant");
+        assert_eq!(message["model"], "claude-x");
+        let content = message["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Hello world");
+        assert_eq!(content[1]["type"], "tool_use");
+        assert_eq!(content[1]["name"], "advisor");
+        // input 由 partial_json 分片拼接后 parse 成对象
+        assert_eq!(content[1]["input"]["focus"], true);
+        assert_eq!(message["stop_reason"], "tool_use");
+        assert_eq!(message["usage"]["output_tokens"], 42);
+    }
+
+    #[test]
+    fn anthropic_sse_to_message_value_aggregates_thinking_with_signature() {
+        let sse = anthropic_sse(&[
+            json!({"type":"message_start","message":{
+                "id":"msg_2","type":"message","role":"assistant","content":[],"stop_reason":null}}),
+            json!({"type":"content_block_start","index":0,
+                   "content_block":{"type":"thinking","thinking":"","signature":""}}),
+            json!({"type":"content_block_delta","index":0,
+                   "delta":{"type":"thinking_delta","thinking":"let me think"}}),
+            json!({"type":"content_block_delta","index":0,
+                   "delta":{"type":"signature_delta","signature":"sig-abc"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}),
+            json!({"type":"message_stop"}),
+        ]);
+        let message = super::anthropic_sse_to_message_value(&sse).unwrap();
+        let content = message["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "let me think");
+        assert_eq!(content[0]["signature"], "sig-abc");
+        assert_eq!(message["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn anthropic_sse_to_message_value_rejects_stream_without_message_start() {
+        // OpenAI 形态的 SSE（choices 块）不是 Anthropic 流——不得误聚合出
+        // 空 content 假成功
+        let sse =
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        let err = super::anthropic_sse_to_message_value(sse).unwrap_err();
+        match err {
+            ProxyError::TransformError(msg) => assert!(msg.contains("message_start"), "{msg}"),
+            other => panic!("expected TransformError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anthropic_sse_to_message_value_rejects_truncated_stream() {
+        // 有 message_start 与内容块，但无 message_stop 也无 stop_reason——疑似
+        // 中途截断，不得包装成「看起来成功」的响应
+        let sse = anthropic_sse(&[
+            json!({"type":"message_start","message":{
+                "id":"msg_3","type":"message","role":"assistant","content":[],"stop_reason":null}}),
+            json!({"type":"content_block_start","index":0,
+                   "content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,
+                   "delta":{"type":"text_delta","text":"partial"}}),
+        ]);
+        let err = super::anthropic_sse_to_message_value(&sse).unwrap_err();
+        match err {
+            ProxyError::TransformError(msg) => assert!(msg.contains("truncated"), "{msg}"),
+            other => panic!("expected TransformError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anthropic_sse_to_message_value_fails_on_error_event() {
+        // error 事件（配额/限流/超载）不得伪装成功（对齐 chat 聚合器 C18）
+        let sse = anthropic_sse(&[
+            json!({"type":"message_start","message":{
+                "id":"msg_4","type":"message","role":"assistant","content":[],"stop_reason":null}}),
+            json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}),
+            json!({"type":"message_stop"}),
+        ]);
+        let err = super::anthropic_sse_to_message_value(&sse).unwrap_err();
+        match err {
+            ProxyError::TransformError(msg) => assert!(msg.contains("Overloaded"), "{msg}"),
+            other => panic!("expected TransformError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anthropic_sse_to_message_value_tolerates_tail_block_without_delimiter() {
+        // 最后一个事件后无空行（半截流/非规范上游）：残余 buffer 仍被处理；
+        // 非 JSON 的尾块被忽略而非误杀
+        let sse = format!(
+            "{}data: {{\"type\":\"message_stop\"}}",
+            anthropic_sse(&[
+                json!({"type":"message_start","message":{
+                    "id":"msg_5","type":"message","role":"assistant","content":[],"stop_reason":null}}),
+                json!({"type":"content_block_start","index":0,
+                       "content_block":{"type":"text","text":""}}),
+                json!({"type":"content_block_delta","index":0,
+                       "delta":{"type":"text_delta","text":"done"}}),
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}),
+            ])
+        );
+        let message = super::anthropic_sse_to_message_value(&sse).unwrap();
+        assert_eq!(message["stop_reason"], "end_turn");
+        assert_eq!(message["content"][0]["text"], "done");
     }
 }

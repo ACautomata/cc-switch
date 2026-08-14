@@ -507,6 +507,27 @@ pub fn merge_pre_advisor_text(mut final_body: Value, accumulated_text: &[Value])
     final_body
 }
 
+/// 续跑响应体非 JSON 且不可聚合时，合成保真 Messages JSON（同步纯函数）。
+///
+/// 续跑响应只含 advisor 之后的输出；raw 透传会静默丢掉已累积的前序 advisor 帧
+/// executor 文本（review #27 F17）。合成体 = 最小 message 骨架 + 累积文本块 +
+/// 不可解析原文（lossy）作为 text 块——两截内容都不丢，客户端拿到合法 JSON。
+pub fn build_unparseable_continuation_body(pre_advisor_text: &[Value], raw_body: &[u8]) -> Value {
+    let mut content: Vec<Value> = pre_advisor_text.to_vec();
+    content.push(json!({
+        "type": "text",
+        "text": format!(
+            "[cc-switch advisor] advisor 续跑的上游响应体无法解析（非 JSON），原文如下：\n{}",
+            String::from_utf8_lossy(raw_body)
+        )
+    }));
+    json!({
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+    })
+}
+
 /// 回注体构造（同步纯函数）：把 advisor 建议包成官方形状
 /// `advisor_tool_result{content: advisor_result{text}}`。
 ///
@@ -589,6 +610,46 @@ pub fn provider_base_url(provider: &Provider) -> Option<String> {
 // ============================================================================
 // 回路编排（非流式成功路径）
 // ============================================================================
+
+/// 非流式 body 读取超时（对齐 executor 主路径 `handle_non_streaming`）：
+/// 故障转移开启且配置非零时生效；否则 `ZERO`（不启用，`read_decoded_body` 语义）。
+///
+/// 回路内**所有**读 body 的位置（子调用响应、循环内各轮、达迭代上限后的
+/// 最终读）必须共用同一计算——此前上限后的最终读硬编码 `Duration::ZERO`
+/// 禁用了配置超时，上游发完头后 body 卡住时该读无限挂起（review #27 F18）。
+fn non_streaming_body_timeout(ctx: &RequestContext) -> std::time::Duration {
+    if ctx.app_config.auto_failover_enabled && ctx.app_config.non_streaming_timeout > 0 {
+        std::time::Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
+    } else {
+        std::time::Duration::ZERO
+    }
+}
+
+/// 非 JSON 响应体的 SSE 聚合臂（review #27 F16/F17）：嗅探 + Anthropic SSE 聚合。
+///
+/// 网关对 stream:false 的请求回 SSE 体（带或不带 text/event-stream Content-Type
+/// ——`is_sse()` 只看头，盖不住错标体）。聚合恢复非流式语义后，回路按既有逻辑
+/// 判定/消费 advisor `tool_use`；聚合失败（不是 SSE / 非 Anthropic 流 / 疑似
+/// 截断）返回 `None`，由调用方走保真分支。
+///
+/// 聚合成功即改写头：body 已重建为 JSON，旧的实体头（content-length 等）与
+/// SSE Content-Type 均失真——剥实体头并改标 `application/json`，否则
+/// `NoAdvisorCall` 透传时 `process_response` 会按旧头把 JSON buffer 当 SSE
+/// 流转发（与 `build_json_response` 重建后改标是同一模式）。
+fn try_aggregate_sse_body(body_bytes: &[u8], headers: &mut axum::http::HeaderMap) -> Option<Value> {
+    let body_str = String::from_utf8_lossy(body_bytes);
+    if !super::handlers::body_looks_like_sse(&body_str) {
+        return None;
+    }
+    let aggregated = super::handlers::anthropic_sse_to_message_value(&body_str).ok()?;
+    super::response_processor::strip_entity_headers_for_rebuilt_body(headers);
+    headers.remove(axum::http::header::CONTENT_TYPE);
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    Some(aggregated)
+}
 
 /// 非流式 advisor 回路入口。
 ///
@@ -721,12 +782,7 @@ pub async fn run_advisor_subcall<F: AdvisorForwarder>(
 
     // 读子调用响应体（非流式）。body 超时对齐 executor 主路径
     // （handle_non_streaming）：故障转移开启且配置非零时生效。
-    let body_timeout =
-        if ctx.app_config.auto_failover_enabled && ctx.app_config.non_streaming_timeout > 0 {
-            std::time::Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
-        } else {
-            std::time::Duration::ZERO
-        };
+    let body_timeout = non_streaming_body_timeout(ctx);
     let (_, _status, body_bytes) =
         super::response_processor::read_decoded_body(response, "Advisor", body_timeout).await?;
 
@@ -801,12 +857,7 @@ pub async fn run_advisor_loop<F: AdvisorForwarder>(
 
         // 读响应体（非流式）。body 超时对齐 executor 主路径
         // （handle_non_streaming）：故障转移开启且配置非零时生效。
-        let body_timeout =
-            if ctx.app_config.auto_failover_enabled && ctx.app_config.non_streaming_timeout > 0 {
-                std::time::Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
-            } else {
-                std::time::Duration::ZERO
-            };
+        let body_timeout = non_streaming_body_timeout(ctx);
         let (mut response_headers, status, body_bytes) =
             super::response_processor::read_decoded_body(response, ctx.tag, body_timeout).await?;
 
@@ -822,18 +873,59 @@ pub async fn run_advisor_loop<F: AdvisorForwarder>(
             });
         }
 
-        // 执行器响应体非 JSON（如网关对 stream:false 误回了无 SSE content-type 的
-        // SSE 体——`is_sse()` 只看响应头，盖不住这种错标 body）：无法据此判定 advisor
-        // `tool_use`，按 `AdvisorLoopOutcome::NoAdvisorCall` 语义重建 buffered 响应
-        // 走正常透传，而非把上游响应替换成 TransformError（regression，review #27）。
-        let response_json: Value = match serde_json::from_slice(&body_bytes) {
-            Ok(value) => value,
-            Err(_) => {
-                log::debug!("[Advisor] 执行器响应体非 JSON，按正常透传处理");
-                return Ok(AdvisorLoopOutcome::NoAdvisorCall {
-                    response: ProxyResponse::buffered(status, response_headers, body_bytes),
-                });
-            }
+        // 解析响应体：JSON 直用；非 JSON 时先按 #2234 兜底哲学嗅探聚合 SSE 体
+        // （review #27 F16/F17）——网关对 stream:false 回 SSE（带或不带 SSE 头），
+        // 聚合恢复非流式语义后走既有 advisor 判定；聚合失败才走保真分支：
+        // - 首轮（尚无被消费的 advisor 帧）：无法据此判定 advisor `tool_use`，按
+        //   `NoAdvisorCall` 语义重建 buffered 响应走正常透传，而非把上游响应替换
+        //   成 TransformError（regression，review #27）。
+        // - 续跑帧（已累积前序文本）：不能 raw 透传——续跑响应只含 advisor 之后的
+        //   输出，raw 透传会静默丢掉累积文本（review #27 F17），合成保真响应。
+        let (response_json, body_bytes) = match serde_json::from_slice(&body_bytes) {
+            Ok(value) => (value, body_bytes),
+            Err(_) => match try_aggregate_sse_body(&body_bytes, &mut response_headers) {
+                Some(aggregated) => {
+                    log::debug!("[Advisor] 执行器响应体为 SSE，聚合成 Messages JSON 处理");
+                    let bytes = bytes::Bytes::from(
+                        serde_json::to_vec(&aggregated).unwrap_or_else(|_| body_bytes.to_vec()),
+                    );
+                    (aggregated, bytes)
+                }
+                None if pre_advisor_text.is_empty() => {
+                    log::debug!("[Advisor] 执行器响应体非 JSON，按正常透传处理");
+                    return Ok(AdvisorLoopOutcome::NoAdvisorCall {
+                        response: ProxyResponse::buffered(status, response_headers, body_bytes),
+                    });
+                }
+                None => {
+                    log::warn!("[Advisor] 续跑响应体非 JSON 且不可聚合，合成保真响应（前序 advisor 帧文本保留）");
+                    // 合成体 = 累积 + 原始体的拷贝：合计不得越界
+                    // （对齐合并分支的聚合上限，review #28 C3 / #27 F14）
+                    if exceeds_response_limit(
+                        pre_advisor_bytes,
+                        body_bytes.len(),
+                        MAX_RESPONSE_BODY_BYTES,
+                    ) {
+                        return Err(ProxyError::ResponseBodyTooLarge(MAX_RESPONSE_BODY_BYTES));
+                    }
+                    let synthesized =
+                        build_unparseable_continuation_body(&pre_advisor_text, &body_bytes);
+                    super::response_processor::strip_entity_headers_for_rebuilt_body(
+                        &mut response_headers,
+                    );
+                    response_headers.remove(axum::http::header::CONTENT_TYPE);
+                    response_headers.insert(
+                        axum::http::header::CONTENT_TYPE,
+                        axum::http::HeaderValue::from_static("application/json"),
+                    );
+                    let bytes = bytes::Bytes::from(
+                        serde_json::to_vec(&synthesized).unwrap_or_else(|_| body_bytes.to_vec()),
+                    );
+                    return Ok(AdvisorLoopOutcome::NoAdvisorCall {
+                        response: ProxyResponse::buffered(status, response_headers, bytes),
+                    });
+                }
+            },
         };
 
         // 续跑决策：响应中是否还有 advisor 调用需要处理（spec 验收标准点名的
@@ -993,10 +1085,14 @@ pub async fn run_advisor_loop<F: AdvisorForwarder>(
         }
     }
 
-    // 达到迭代上限：读最后一次响应
-    let (headers_out, status, body_bytes) =
-        super::response_processor::read_decoded_body(response, ctx.tag, std::time::Duration::ZERO)
-            .await?;
+    // 达到迭代上限：读最后一次响应。超时与循环内各轮一致（review #27 F18）：
+    // 此前硬编码 `Duration::ZERO` 禁用超时，上限后的 stalled body 会无限挂起。
+    let (headers_out, status, body_bytes) = super::response_processor::read_decoded_body(
+        response,
+        ctx.tag,
+        non_streaming_body_timeout(ctx),
+    )
+    .await?;
     if !status.is_success() {
         let body_json = serde_json::from_slice(&body_bytes).unwrap_or_else(
             |_| json!({"error": {"message": String::from_utf8_lossy(&body_bytes).to_string()}}),
@@ -1631,12 +1727,19 @@ mod tests {
     /// 按脚本返回响应的 stub forwarder（不发网络）。
     /// - 子调用（is_advisor_subcall=true）→ 固定建议文本
     /// - 续跑（is_advisor_subcall=false）→ 按调用序返回脚本帧
+    /// - `raw_cont_at`：第 n 次（0-based）续跑改为返回 `raw_cont_body` 原样
+    ///   bytes（F17 非 JSON 续跑帧复现用）
+    /// - `stall_cont_from`：第 n 次（0-based）续跑起改为返回「发完响应头后
+    ///   body 永不完成」的卡死响应（F18 上游 stall 现场）
     struct ScriptedForwarder {
         continuations: std::sync::Mutex<Vec<Value>>,
         /// 续跑帧响应携带的头（如上游 content-length，C1 复现用）
         cont_headers: std::sync::Mutex<Vec<axum::http::HeaderMap>>,
         adv_calls: std::sync::atomic::AtomicUsize,
         cont_calls: std::sync::atomic::AtomicUsize,
+        raw_cont_at: Option<usize>,
+        raw_cont_body: bytes::Bytes,
+        stall_cont_from: Option<usize>,
     }
 
     impl AdvisorForwarder for ScriptedForwarder {
@@ -1653,35 +1756,47 @@ mod tests {
             is_advisor_subcall: bool,
         ) -> impl std::future::Future<Output = Result<(ProxyResponse, String, String), ProxyError>> + Send
         {
-            let body = if is_advisor_subcall {
+            let response = if is_advisor_subcall {
                 self.adv_calls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                json!({"content":[{"type":"text","text":"advisor advice"}]})
+                let bytes = serde_json::to_vec(
+                    &json!({"content":[{"type":"text","text":"advisor advice"}]}),
+                )
+                .unwrap();
+                ProxyResponse::buffered(
+                    http::StatusCode::OK,
+                    axum::http::HeaderMap::new(),
+                    bytes::Bytes::from(bytes),
+                )
             } else {
-                self.cont_calls
+                let call_idx = self
+                    .cont_calls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                // 弹出下一个脚本帧；耗尽则给一个无 advisor 的收尾帧
-                self.continuations.lock().unwrap().pop().unwrap_or_else(|| {
-                    json!({"content":[{"type":"text","text":"final answer"}],"stop_reason":"end_turn"})
-                })
-            };
-            let headers = if is_advisor_subcall {
-                axum::http::HeaderMap::new()
-            } else {
-                self.cont_headers.lock().unwrap().pop().unwrap_or_default()
-            };
-            let bytes = serde_json::to_vec(&body).unwrap();
-            async move {
-                Ok((
+                if self.raw_cont_at == Some(call_idx) {
+                    // F17 复现：非 JSON 续跑帧原样返回
+                    ProxyResponse::buffered(
+                        http::StatusCode::OK,
+                        axum::http::HeaderMap::new(),
+                        self.raw_cont_body.clone(),
+                    )
+                } else if self.stall_cont_from.is_some_and(|n| call_idx >= n) {
+                    // 上游 stall 现场：响应头已到、body 永不完成
+                    stalled_body_response()
+                } else {
+                    // 弹出下一个脚本帧；耗尽则给一个无 advisor 的收尾帧
+                    let body = self.continuations.lock().unwrap().pop().unwrap_or_else(|| {
+                        json!({"content":[{"type":"text","text":"final answer"}],"stop_reason":"end_turn"})
+                    });
+                    let headers = self.cont_headers.lock().unwrap().pop().unwrap_or_default();
+                    let bytes = serde_json::to_vec(&body).unwrap();
                     ProxyResponse::buffered(
                         http::StatusCode::OK,
                         headers,
                         bytes::Bytes::from(bytes),
-                    ),
-                    "stub".to_string(),
-                    "stub-model".to_string(),
-                ))
-            }
+                    )
+                }
+            };
+            async move { Ok((response, "stub".to_string(), "stub-model".to_string())) }
         }
     }
 
@@ -1692,6 +1807,397 @@ mod tests {
             axum::http::HeaderMap::new(),
             bytes::Bytes::from(bytes),
         )
+    }
+
+    /// 响应头已发完、body 永不完成的响应（上游 stall 现场，F18 复现用）。
+    fn stalled_body_response() -> ProxyResponse {
+        struct NeverBody;
+        impl futures::Stream for NeverBody {
+            type Item = Result<bytes::Bytes, std::io::Error>;
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                std::task::Poll::Pending
+            }
+        }
+        ProxyResponse::streamed(
+            http::StatusCode::OK,
+            axum::http::HeaderMap::new(),
+            NeverBody,
+        )
+    }
+
+    /// 把 Anthropic SSE 事件序列打包成带 `text/event-stream` 头的响应
+    /// （F16 复现：网关对 stream:false 回 SSE）。
+    fn buffered_sse(events: &[Value]) -> ProxyResponse {
+        let mut body = String::new();
+        for event in events {
+            body.push_str(&format!(
+                "event: {}\ndata: {}\n\n",
+                event["type"].as_str().unwrap_or_default(),
+                event
+            ));
+        }
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+        ProxyResponse::buffered(http::StatusCode::OK, headers, bytes::Bytes::from(body))
+    }
+
+    /// SSE 事件序列：`content` 块（text / tool_use）→ message_delta/stop 收尾。
+    /// 块由 `(index, block, deltas)` 描述，deltas 逐个下发。
+    fn sse_events(id: &str, blocks: &[(Value, Vec<Value>)], stop_reason: &str) -> Vec<Value> {
+        let mut events = vec![json!({
+            "type": "message_start",
+            "message": {"id": id, "type": "message", "role": "assistant",
+                        "content": [], "stop_reason": null}
+        })];
+        for (index, (block, deltas)) in blocks.iter().enumerate() {
+            events.push(json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": block
+            }));
+            for delta in deltas {
+                events.push(json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": delta
+                }));
+            }
+            events.push(json!({"type": "content_block_stop", "index": index}));
+        }
+        events.push(json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": null}
+        }));
+        events.push(json!({"type": "message_stop"}));
+        events
+    }
+
+    fn text_texts(body: &Value) -> Vec<String> {
+        body["content"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|b| {
+                        (b["type"] == "text").then(|| b["text"].as_str().unwrap_or("").to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn test_ctx() -> crate::proxy::handler_context::RequestContext {
+        let provider = Provider::with_id(
+            "p".into(),
+            "P".into(),
+            json!({"env":{"ANTHROPIC_BASE_URL":"https://k3.example.com"}}),
+            None,
+        );
+        crate::proxy::handler_context::RequestContext::for_test(
+            provider,
+            "claude-sonnet-4-5",
+            AppType::Claude,
+        )
+    }
+
+    fn rewritten_request_body() -> Value {
+        json!({
+            "model":"claude-sonnet-4-5",
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"name":"advisor","input_schema":{"type":"object","properties":{},"required":[]}}]
+        })
+    }
+
+    /// F16（codex review #27，2026-08-14）：网关对 stream:false 的请求回了带
+    /// SSE Content-Type 的响应，而请求已被改写（注入合成客户端工具 `advisor`）。
+    /// 此前 `is_sse()` 头检查把这类响应挡在回路外原样透传——流里 executor 对
+    /// 合成工具的 `tool_use` 直达客户端（其工具注册表没有 `advisor`），turn 卡死。
+    /// 回路必须聚合 SSE、消费其中的 advisor `tool_use`（子调用 + 续跑），最终
+    /// 响应既含前文本、也不泄漏合成 tool_use。
+    #[tokio::test]
+    async fn advisor_loop_consumes_sse_response_with_advisor_tool_use() {
+        let ctx = test_ctx();
+        // 续跑帧：正常 JSON、无 advisor → 回路终止
+        let forwarder = ScriptedForwarder {
+            continuations: std::sync::Mutex::new(vec![json!({
+                "content":[{"type":"text","text":"final answer"}],
+                "stop_reason":"end_turn"
+            })]),
+            cont_headers: std::sync::Mutex::new(vec![]),
+            adv_calls: std::sync::atomic::AtomicUsize::new(0),
+            cont_calls: std::sync::atomic::AtomicUsize::new(0),
+            raw_cont_at: None,
+            raw_cont_body: bytes::Bytes::new(),
+            stall_cont_from: None,
+        };
+
+        // 首响应：SSE 体（text 块 + advisor tool_use 块）
+        let first_response = buffered_sse(&sse_events(
+            "msg_sse",
+            &[
+                (
+                    json!({"type":"text","text":""}),
+                    vec![json!({"type":"text_delta","text":"pre-advisor reasoning"})],
+                ),
+                (
+                    json!({"type":"tool_use","id":"toolu_01","name":"advisor","input":{}}),
+                    vec![json!({"type":"input_json_delta","partial_json":"{}"})],
+                ),
+            ],
+            "tool_use",
+        ));
+
+        let outcome = run_advisor_loop(
+            &ctx,
+            &forwarder,
+            http::Method::POST,
+            "/v1/messages",
+            axum::http::HeaderMap::new(),
+            http::Extensions::new(),
+            &rewritten_request_body(),
+            AdvisorToolCapture::default(),
+            first_response,
+        )
+        .await
+        .expect("advisor loop 应正常完成");
+
+        // 终止帧（续跑后）无 advisor → NoAdvisorCall 透传合并体
+        let AdvisorLoopOutcome::NoAdvisorCall { response } = outcome else {
+            panic!("终止帧无 advisor，应走 NoAdvisorCall 透传合并体");
+        };
+        let (_, _, body_bytes) = crate::proxy::response_processor::read_decoded_body(
+            response,
+            "Advisor",
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+        // 前文本（SSE 帧的 text 块）保留 + 续跑帧文本；合成 advisor tool_use
+        // 不出现在最终响应（回路已消费）
+        assert_eq!(
+            text_texts(&body),
+            vec!["pre-advisor reasoning", "final answer"]
+        );
+        assert!(body["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| !(b["type"] == "tool_use" && b["name"] == "advisor")));
+        // 子调用确实发生（SSE 里的 advisor 被捕获，而非透传）
+        assert_eq!(
+            forwarder
+                .adv_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    /// F16 无 advisor 变体：SSE 首响应不含 advisor `tool_use` → 聚合成
+    /// Messages JSON 后按 `NoAdvisorCall` 透传，但 body 已重建为 JSON、
+    /// Content-Type 改标 `application/json`（旧头是 text/event-stream，留着会让
+    /// `process_response` 把 JSON buffer 当 SSE 流转发）。
+    #[tokio::test]
+    async fn advisor_loop_sse_response_without_advisor_aggregates_to_json() {
+        let ctx = test_ctx();
+        let forwarder = ScriptedForwarder {
+            continuations: std::sync::Mutex::new(vec![]),
+            cont_headers: std::sync::Mutex::new(vec![]),
+            adv_calls: std::sync::atomic::AtomicUsize::new(0),
+            cont_calls: std::sync::atomic::AtomicUsize::new(0),
+            raw_cont_at: None,
+            raw_cont_body: bytes::Bytes::new(),
+            stall_cont_from: None,
+        };
+
+        let first_response = buffered_sse(&sse_events(
+            "msg_sse2",
+            &[(
+                json!({"type":"text","text":""}),
+                vec![json!({"type":"text_delta","text":"plain answer"})],
+            )],
+            "end_turn",
+        ));
+
+        let outcome = run_advisor_loop(
+            &ctx,
+            &forwarder,
+            http::Method::POST,
+            "/v1/messages",
+            axum::http::HeaderMap::new(),
+            http::Extensions::new(),
+            &rewritten_request_body(),
+            AdvisorToolCapture::default(),
+            first_response,
+        )
+        .await
+        .expect("advisor loop 应正常完成");
+
+        let AdvisorLoopOutcome::NoAdvisorCall { response } = outcome else {
+            panic!("SSE 首响应无 advisor tool_use，应走 NoAdvisorCall");
+        };
+        // 头已改标 JSON（非 SSE）
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let (_, _, body_bytes) = crate::proxy::response_processor::read_decoded_body(
+            response,
+            "Advisor",
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(text_texts(&body), vec!["plain answer"]);
+    }
+
+    /// F17（codex review #27，2026-08-14）：已消费 advisor 帧后，续跑响应返回
+    /// **非 JSON**（且不像 SSE）的 body——此前无条件 raw 透传，`pre_advisor_text`
+    /// 里累积的前序 executor 文本被静默丢弃（续跑响应只含 advisor 之后的输出）。
+    /// 修复后：合成保真响应（累积文本 + 不可解析原文），客户端两截内容都拿到。
+    #[tokio::test]
+    async fn advisor_loop_continuation_non_json_preserves_accumulated_text() {
+        let ctx = test_ctx();
+        // 续跑 #0：非 JSON 原始 body（如网关错误页）
+        let forwarder = ScriptedForwarder {
+            continuations: std::sync::Mutex::new(vec![]),
+            cont_headers: std::sync::Mutex::new(vec![]),
+            adv_calls: std::sync::atomic::AtomicUsize::new(0),
+            cont_calls: std::sync::atomic::AtomicUsize::new(0),
+            raw_cont_at: Some(0),
+            raw_cont_body: bytes::Bytes::from_static(b"<html>upstream broke</html>"),
+            stall_cont_from: None,
+        };
+
+        // 首帧：JSON，含前文本 + advisor tool_use
+        let first_response = buffered_json(json!({
+            "content":[
+                {"type":"text","text":"pre-advisor reasoning"},
+                {"type":"tool_use","id":"toolu_01","name":"advisor","input":{}}
+            ],
+            "stop_reason":"tool_use"
+        }));
+
+        let outcome = run_advisor_loop(
+            &ctx,
+            &forwarder,
+            http::Method::POST,
+            "/v1/messages",
+            axum::http::HeaderMap::new(),
+            http::Extensions::new(),
+            &rewritten_request_body(),
+            AdvisorToolCapture::default(),
+            first_response,
+        )
+        .await
+        .expect("advisor loop 应正常完成");
+
+        let AdvisorLoopOutcome::NoAdvisorCall { response } = outcome else {
+            panic!("非 JSON 续跑帧不可聚合，应按 NoAdvisorCall 透传合成保真响应");
+        };
+        // 头是 JSON（合成体重建过）
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let (_, _, body_bytes) = crate::proxy::response_processor::read_decoded_body(
+            response,
+            "Advisor",
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+        // 累积前文本保留 + 原文以 text 块呈现
+        let texts = text_texts(&body);
+        assert_eq!(
+            texts.first().map(String::as_str),
+            Some("pre-advisor reasoning")
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("upstream broke")),
+            "不可解析原文应以 text 块呈现: {texts:?}"
+        );
+    }
+
+    /// F17 聚合臂变体：续跑响应是**错标 SSE**（无 SSE 头、body 是 SSE 体）且不含
+    /// advisor `tool_use` → 嗅探聚合恢复非流式语义，前序文本经合并分支保真。
+    #[tokio::test]
+    async fn advisor_loop_continuation_mislabeled_sse_aggregates_and_merges() {
+        let ctx = test_ctx();
+        // 续跑 #0：无 SSE 头、body 是 SSE 体（错标形态）
+        let events = sse_events(
+            "msg_cont",
+            &[(
+                json!({"type":"text","text":""}),
+                vec![json!({"type":"text_delta","text":"post-advisor answer"})],
+            )],
+            "end_turn",
+        );
+        let mut sse_body = String::new();
+        for event in &events {
+            sse_body.push_str(&format!("data: {}\n\n", event));
+        }
+        let forwarder = ScriptedForwarder {
+            continuations: std::sync::Mutex::new(vec![]),
+            cont_headers: std::sync::Mutex::new(vec![]),
+            adv_calls: std::sync::atomic::AtomicUsize::new(0),
+            cont_calls: std::sync::atomic::AtomicUsize::new(0),
+            raw_cont_at: Some(0),
+            raw_cont_body: bytes::Bytes::from(sse_body),
+            stall_cont_from: None,
+        };
+
+        let first_response = buffered_json(json!({
+            "content":[
+                {"type":"text","text":"pre-advisor reasoning"},
+                {"type":"tool_use","id":"toolu_01","name":"advisor","input":{}}
+            ],
+            "stop_reason":"tool_use"
+        }));
+
+        let outcome = run_advisor_loop(
+            &ctx,
+            &forwarder,
+            http::Method::POST,
+            "/v1/messages",
+            axum::http::HeaderMap::new(),
+            http::Extensions::new(),
+            &rewritten_request_body(),
+            AdvisorToolCapture::default(),
+            first_response,
+        )
+        .await
+        .expect("advisor loop 应正常完成");
+
+        let AdvisorLoopOutcome::NoAdvisorCall { response } = outcome else {
+            panic!("聚合后的续跑帧无 advisor，应按 NoAdvisorCall 透传");
+        };
+        let (_, _, body_bytes) = crate::proxy::response_processor::read_decoded_body(
+            response,
+            "Advisor",
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+        // 合并分支：前文本 + 聚合后的续跑文本
+        assert_eq!(
+            text_texts(&body),
+            vec!["pre-advisor reasoning", "post-advisor answer"]
+        );
     }
 
     #[tokio::test]
@@ -1720,6 +2226,9 @@ mod tests {
             cont_headers: std::sync::Mutex::new(vec![]),
             adv_calls: std::sync::atomic::AtomicUsize::new(0),
             cont_calls: std::sync::atomic::AtomicUsize::new(0),
+            raw_cont_at: None,
+            raw_cont_body: bytes::Bytes::new(),
+            stall_cont_from: None,
         };
 
         // 首帧（传入 run_advisor_loop 的 response 参数）：advisor 调用前文本 + tool_use
@@ -1833,6 +2342,9 @@ mod tests {
             cont_headers: std::sync::Mutex::new(vec![upstream_headers]),
             adv_calls: std::sync::atomic::AtomicUsize::new(0),
             cont_calls: std::sync::atomic::AtomicUsize::new(0),
+            raw_cont_at: None,
+            raw_cont_body: bytes::Bytes::new(),
+            stall_cont_from: None,
         };
 
         // 首帧：advisor 调用前文本 + tool_use
@@ -2039,5 +2551,117 @@ mod tests {
             .map(|b| serde_json::to_vec(b).unwrap().len() + 1)
             .sum();
         assert_eq!(serialized_blocks_bytes(&blocks, exact), Some(exact));
+    }
+
+    /// F17：续跑帧非 JSON 且不可聚合时的合成保真体——累积文本块在前，
+    /// 不可解析原文以 text 块呈现（lossy），两截内容都不丢。
+    #[test]
+    fn build_unparseable_continuation_body_preserves_both_parts() {
+        let pre = vec![json!({"type": "text", "text": "pre-advisor reasoning"})];
+        let body = build_unparseable_continuation_body(&pre, b"<html>upstream broke</html>");
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["role"], "assistant");
+        let content = body["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["text"], "pre-advisor reasoning");
+        let raw_text = content[1]["text"].as_str().unwrap();
+        assert!(
+            raw_text.contains("upstream broke"),
+            "原文应以 text 块呈现: {raw_text}"
+        );
+        assert!(
+            raw_text.contains("无法解析"),
+            "应说明原文不可解析的来源: {raw_text}"
+        );
+    }
+
+    // ── 回路编排（review #27 F18：上限后的最终读应用配置超时）──
+
+    /// F18（codex review #27，2026-08-14）：达到回路迭代上限后的**最终读 body**
+    /// 曾硬编码 `Duration::ZERO`（= 不启用超时），而循环内各轮读 body 按配置的
+    /// `non_streaming_timeout` 生效——上游发完响应头后 body 卡住时，上限后的
+    /// 最终读会无限挂起。
+    ///
+    /// 场景：executor 连续调 advisor 打满迭代上限（4 轮），最后一轮续跑响应
+    /// 发完头后 body 永不完成（pending 流）。配置 1s 非流式超时 → 5s 外层限时内
+    /// 应返回 `ProxyError::Timeout`；修复前（ZERO）最终读永不超时、回路无限挂起，
+    /// 仅外层 Elapsed 兜底。
+    #[tokio::test]
+    async fn advisor_loop_limit_final_read_honors_configured_timeout() {
+        let provider = Provider::with_id(
+            "p".into(),
+            "P".into(),
+            json!({"env":{"ANTHROPIC_BASE_URL":"https://k3.example.com"}}),
+            None,
+        );
+        let mut ctx = crate::proxy::handler_context::RequestContext::for_test(
+            provider,
+            "claude-sonnet-4-5",
+            AppType::Claude,
+        );
+        ctx.app_config.auto_failover_enabled = true;
+        ctx.app_config.non_streaming_timeout = 1;
+
+        // 续跑 #0-#2：仍带 advisor 的脚本帧（推进循环）；#3 起：发完头后 body 永不完成
+        let advisor_frame = || {
+            json!({
+                "content":[{"type":"tool_use","id":"toolu_cont","name":"advisor","input":{}}],
+                "stop_reason":"tool_use"
+            })
+        };
+        let forwarder = ScriptedForwarder {
+            continuations: std::sync::Mutex::new(vec![
+                advisor_frame(),
+                advisor_frame(),
+                advisor_frame(),
+            ]),
+            cont_headers: std::sync::Mutex::new(vec![]),
+            adv_calls: std::sync::atomic::AtomicUsize::new(0),
+            cont_calls: std::sync::atomic::AtomicUsize::new(0),
+            raw_cont_at: None,
+            raw_cont_body: bytes::Bytes::new(),
+            stall_cont_from: Some(3),
+        };
+
+        // 首帧带 advisor（iter1 消费）→ 4 轮全打满 → iter5 触发上限 break →
+        // 最终读 #3 的 stalled body
+        let first_response = buffered_json(json!({
+            "content":[{"type":"tool_use","id":"toolu_01","name":"advisor","input":{}}],
+            "stop_reason":"tool_use"
+        }));
+        let rewritten_body = json!({
+            "model":"claude-sonnet-4-5",
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"name":"advisor","input_schema":{"type":"object","properties":{},"required":[]}}]
+        });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_advisor_loop(
+                &ctx,
+                &forwarder,
+                http::Method::POST,
+                "/v1/messages",
+                axum::http::HeaderMap::new(),
+                http::Extensions::new(),
+                &rewritten_body,
+                AdvisorToolCapture::default(),
+                first_response,
+            ),
+        )
+        .await;
+
+        match outcome {
+            // 修复后：上限后的最终读按配置超时（1s）中断，返回 Timeout
+            Ok(Err(ProxyError::Timeout(msg))) => {
+                assert!(msg.contains("响应体读取超时"), "超时消息不符: {msg}");
+            }
+            // 修复前：最终读禁用超时 → 回路无限挂起，仅外层 5s 兜底
+            Err(_) => panic!(
+                "run_advisor_loop 无限挂起（外层 5s 兜底）——上限后的最终读未应用配置超时（F18）"
+            ),
+            Ok(Ok(_)) => panic!("预期 ProxyError::Timeout，回路却正常完成"),
+            Ok(Err(_)) => panic!("预期 ProxyError::Timeout，得到其它错误"),
+        }
     }
 }
