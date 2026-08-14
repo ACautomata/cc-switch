@@ -304,7 +304,7 @@ async fn handle_messages_for_app(
             // forwarder——不计入客户端请求维度的 total/success/failed/success_rate
             // （review #27）；熔断/路由仍走共享 router，行为不变。
             let forwarder2 = ctx.create_forwarder(&state).with_isolated_status();
-            match super::advisor::run_advisor_loop(
+            let outcome = match super::advisor::run_advisor_loop(
                 &ctx,
                 &forwarder2,
                 method,
@@ -315,8 +315,19 @@ async fn handle_messages_for_app(
                 capture,
                 response,
             )
-            .await?
+            .await
             {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // 回路失败（续跑超时 / 超限 / 解析失败等）→ 客户端拿到错误。
+                    // 主 forward 已在共享 status 记过成功（2xx 即记），把该入站
+                    // 请求改记失败，否则失败请求被计成功、success_rate 虚高
+                    // （review #27 F15）。仅动客户端请求维度，熔断记录不动。
+                    forwarder.reclassify_success_as_failure(&e).await;
+                    return Err(e);
+                }
+            };
+            match outcome {
                 super::advisor::AdvisorLoopOutcome::NoAdvisorCall { response } => {
                     // 无 advisor 调用：走正常透传流程
                     process_response(
@@ -335,7 +346,13 @@ async fn handle_messages_for_app(
                 } => {
                     // usage 落库（executor 最终响应；切片 5 会补充 advisor 行）
                     if usage_logging_enabled(&state) {
-                        spawn_claude_usage_log(&state, &ctx, &final_body, status_out.as_u16(), false);
+                        spawn_claude_usage_log(
+                            &state,
+                            &ctx,
+                            &final_body,
+                            status_out.as_u16(),
+                            false,
+                        );
                     }
 
                     // 构建响应（共享 helper：剥实体头 + 强制 JSON Content-Type）
