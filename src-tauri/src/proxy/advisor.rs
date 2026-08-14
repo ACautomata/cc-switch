@@ -292,13 +292,23 @@ pub fn resolve_advisor_model(
 /// 档位是否在 provider 配置了映射（对齐 `ModelMapping::map_model` 的判定）。
 ///
 /// fable 未单独配置时归入 opus 档（与 map_model 的注释一致），故 fable 的
-/// 配置判定是 fable_model 或 opus_model 任一存在；具体模型 ID（非档名）视为
-/// 已配置——由 forwarder 管线决定是否命中。
+/// 配置判定是 fable_model 或 opus_model 任一存在；纯档位别名（fable/opus/sonnet/haiku
+/// 裸词）未配该档映射时回落 executor 模型。
+///
+/// **具体模型 ID 不走此回落**（review #27 F09）：`claude-opus-4-8`、`claude-sonnet-4-5`
+/// 等以 `claude-` 开头的具体 ID 一律放行——交由 forwarder 管线的 `model_mapper`
+/// 一致处理（与 executor 同一条映射管线：命中已配档则映射、未命中且无 default 则
+/// 原样透传给端点）。否则客户端明确指定的具体模型会被档位未配误判丢弃、改跑
+/// executor（常更弱）的模型。
 fn advisor_tier_is_configured(
     tier: &str,
     mapping: &super::model_mapper::ModelMapping,
 ) -> bool {
     let lower = tier.to_lowercase();
+    // 具体 Anthropic 模型 ID：放行，由 model_mapper 与 executor 一致地处理。
+    if lower.starts_with("claude-") {
+        return true;
+    }
     if lower.contains("fable") {
         mapping.fable_model.is_some() || mapping.opus_model.is_some()
     } else if lower.contains("haiku") {
@@ -308,6 +318,7 @@ fn advisor_tier_is_configured(
     } else if lower.contains("sonnet") {
         mapping.sonnet_model.is_some()
     } else {
+        // 非 Claude 命名的具体模型（如 deepseek-r1、gpt-4）：放行原样透传。
         true
     }
 }
@@ -397,6 +408,44 @@ pub fn extract_advisor_text(response: &Value) -> Option<String> {
     } else {
         Some(text.join("\n"))
     }
+}
+
+/// 从响应 content 中取出所有 `text` 块（advisor 调用前的 executor 文本）。
+///
+/// 用于回路**累积被消费帧里的 executor 文本**——advisor 调用前的文本在官方服务端
+/// advisor 流程里会到达客户端（issue-5 §5:133-137 先流式发出再 pause；§8 iterations
+/// 只藏 token 计数、不藏文本），而本地回路只回最后一帧会丢失它（review #27 F08）。
+/// 只取 text 块；不收集 advisor `tool_use`（合成客户端工具，客户端注册表里没有）。
+pub fn extract_text_blocks(response: &Value) -> Vec<Value> {
+    response
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 把累积的 advisor 前文本块前置进最终响应体的 content（review #27 F08）。
+///
+/// 累积为空 → 原样返回（no-op，保护常见无 advisor 路径）。最终体无 content 数组
+/// （非 Messages 响应体）→ 不强行合成、原样返回。仅前置 text 块；最终帧自身的
+/// content（其文本 / 客户端已知的 tool_use）保持顺序在后。
+pub fn merge_pre_advisor_text(mut final_body: Value, accumulated_text: &[Value]) -> Value {
+    if accumulated_text.is_empty() {
+        return final_body;
+    }
+    let Some(arr) = final_body.get("content").and_then(Value::as_array) else {
+        return final_body;
+    };
+    let mut merged: Vec<Value> = accumulated_text.to_vec();
+    merged.extend(arr.iter().cloned());
+    final_body["content"] = Value::Array(merged);
+    final_body
 }
 
 /// 回注体构造（同步纯函数）：把 advisor 建议包成官方形状
@@ -497,47 +546,68 @@ pub fn provider_base_url(provider: &Provider) -> Option<String> {
 /// 调一两次。
 pub const ADVISOR_LOOP_MAX_ITERATIONS: usize = 4;
 
-/// 子调用与续跑共用的「转发一次」帮助函数。
+/// advisor 回路的「转发一次」抽象（测试 seam，review #27 F08）。
 ///
+/// 把回路对上游的依赖收窄成一个可替换的策略：生产实现 = [`RequestForwarder`]
+/// （复用 executor 管线 + 隔离 status），测试用 stub 不发网络、按脚本返回响应，
+/// 从而让 `run_advisor_loop` 的回路行为可单测（此前回路零测试、且钉死具体类型）。
 /// 单元素 providers → forwarder 跳过熔断器（failover 钉死语义，ADR-0001）。
-/// `is_advisor_subcall` 仅用于日志。
-#[allow(clippy::too_many_arguments)]
-async fn forward_once(
-    forwarder: &RequestForwarder,
-    app_type: &AppType,
-    method: http::Method,
-    endpoint: &str,
-    body: Value,
-    headers: axum::http::HeaderMap,
-    extensions: http::Extensions,
-    provider: &Provider,
-    is_advisor_subcall: bool,
-) -> Result<(ProxyResponse, String, String, Option<http::Extensions>), ProxyError> {
-    let label = if is_advisor_subcall {
-        "advisor 子调用"
-    } else {
-        "executor 续跑"
-    };
-    let result = forwarder
-        .forward_with_retry(
-            app_type,
-            method,
-            endpoint,
-            body,
-            headers,
-            extensions,
-            vec![provider.clone()],
-        )
-        .await
-        .map_err(|e: ForwardError| e.error)?;
-    let provider_id = result.provider.id.clone();
-    let outbound_model = result.outbound_model.clone().unwrap_or_default();
-    log::debug!(
-        "[Advisor] {label} 成功: provider={}, outbound_model={}",
-        provider_id,
-        outbound_model
-    );
-    Ok((result.response, provider_id, outbound_model, None))
+/// `is_advisor_subcall` 仅用于日志。返回 (响应, provider_id, outbound_model)。
+pub trait AdvisorForwarder: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    fn forward_once(
+        &self,
+        app_type: &AppType,
+        method: http::Method,
+        endpoint: &str,
+        body: Value,
+        headers: axum::http::HeaderMap,
+        extensions: http::Extensions,
+        provider: &Provider,
+        is_advisor_subcall: bool,
+    ) -> impl std::future::Future<Output = Result<(ProxyResponse, String, String), ProxyError>> + Send;
+}
+
+impl AdvisorForwarder for RequestForwarder {
+    fn forward_once(
+        &self,
+        app_type: &AppType,
+        method: http::Method,
+        endpoint: &str,
+        body: Value,
+        headers: axum::http::HeaderMap,
+        extensions: http::Extensions,
+        provider: &Provider,
+        is_advisor_subcall: bool,
+    ) -> impl std::future::Future<Output = Result<(ProxyResponse, String, String), ProxyError>> + Send {
+        let label = if is_advisor_subcall {
+            "advisor 子调用"
+        } else {
+            "executor 续跑"
+        };
+        async move {
+            let result = self
+                .forward_with_retry(
+                    app_type,
+                    method,
+                    endpoint,
+                    body,
+                    headers,
+                    extensions,
+                    vec![provider.clone()],
+                )
+                .await
+                .map_err(|e: ForwardError| e.error)?;
+            let provider_id = result.provider.id.clone();
+            let outbound_model = result.outbound_model.clone().unwrap_or_default();
+            log::debug!(
+                "[Advisor] {label} 成功: provider={}, outbound_model={}",
+                provider_id,
+                outbound_model
+            );
+            Ok((result.response, provider_id, outbound_model))
+        }
+    }
 }
 
 /// 发起一次 advisor 子调用（非流式 `/v1/messages`）。
@@ -546,9 +616,9 @@ async fn forward_once(
 /// 提示 + 完整转录 + 空 `tools`，`max_tokens` 沿用 executor 请求值。
 /// 模型档位经 `resolve_advisor_model` 解析，由 forwarder 管线做唯一一次映射。
 #[allow(clippy::too_many_arguments)]
-pub async fn run_advisor_subcall(
+pub async fn run_advisor_subcall<F: AdvisorForwarder>(
     ctx: &RequestContext,
-    forwarder: &RequestForwarder,
+    forwarder: &F,
     method: http::Method,
     endpoint: &str,
     headers: axum::http::HeaderMap,
@@ -576,18 +646,18 @@ pub async fn run_advisor_subcall(
 
     let advisor_body = build_advisor_request(executor_body, &advisor_model, None, messages);
 
-    let (response, _provider_id, _outbound_model, _ext) = forward_once(
-        forwarder,
-        &ctx.app_type,
-        method,
-        endpoint,
-        advisor_body,
-        headers,
-        extensions,
-        &ctx.provider,
-        true,
-    )
-    .await?;
+    let (response, _provider_id, _outbound_model) = forwarder
+        .forward_once(
+            &ctx.app_type,
+            method,
+            endpoint,
+            advisor_body,
+            headers,
+            extensions,
+            &ctx.provider,
+            true,
+        )
+        .await?;
 
     // 读子调用响应体（非流式）。body 超时对齐 executor 主路径
     // （handle_non_streaming）：故障转移开启且配置非零时生效。
@@ -643,9 +713,9 @@ pub enum AdvisorLoopOutcome {
 /// （`NoAdvisorCall`，继续 `process_response`）还是直接构建最终响应
 /// （`Completed`）。
 #[allow(clippy::too_many_arguments)]
-pub async fn run_advisor_loop(
+pub async fn run_advisor_loop<F: AdvisorForwarder>(
     ctx: &RequestContext,
-    forwarder: &RequestForwarder,
+    forwarder: &F,
     method: http::Method,
     endpoint: &str,
     headers: axum::http::HeaderMap,
@@ -655,6 +725,10 @@ pub async fn run_advisor_loop(
     mut response: ProxyResponse,
 ) -> Result<AdvisorLoopOutcome, ProxyError> {
     let mut current_body = rewritten_body.clone();
+    // 累积每个被消费的 advisor 帧（含 advisor tool_use 那一帧）里的 executor 文本——
+    // 这些文本在官方服务端 advisor 流程里会到达客户端（issue-5 §5/§8），本地回路
+    // 只回最后一帧会丢失它（review #27 F08）。回路结束时前置合并进最终响应。
+    let mut pre_advisor_text: Vec<Value> = Vec::new();
     let mut iterations = 0usize;
 
     loop {
@@ -708,10 +782,24 @@ pub async fn run_advisor_loop(
         // 纯函数；循环用它判定是否结束）。
         if !should_continue_with_advisor(&response_json) {
             log::debug!("[Advisor] 无 advisor 调用，回路结束");
+            // 有前序 advisor 帧（累积文本非空）→ 把 executor 前文本合并进最终响应体
+            // 再透传（review #27 F08）；无前序 advisor 帧则原样透传（常见路径，no-op）。
+            let body_bytes = if pre_advisor_text.is_empty() {
+                body_bytes
+            } else {
+                let merged = merge_pre_advisor_text(response_json, &pre_advisor_text);
+                bytes::Bytes::from(
+                    serde_json::to_vec(&merged).unwrap_or_else(|_| body_bytes.to_vec()),
+                )
+            };
             return Ok(AdvisorLoopOutcome::NoAdvisorCall {
                 response: ProxyResponse::buffered(status, response_headers, body_bytes),
             });
         }
+
+        // 本帧含 advisor tool_use、即将被消费：累积其 executor 文本（advisor 调用前
+        // 的部分），回路结束时前置合并进最终响应（review #27 F08）。
+        pre_advisor_text.extend(extract_text_blocks(&response_json));
 
         // 判定通过 → 必定能取到 advisor tool_use 块
         let tool_use = find_advisor_tool_use(&response_json)
@@ -768,20 +856,20 @@ pub async fn run_advisor_loop(
             &assistant_message,
             &injection_message,
         );
-        match forward_once(
-            forwarder,
-            &ctx.app_type,
-            method.clone(),
-            endpoint,
-            continued_body.clone(),
-            headers.clone(),
-            extensions.clone(),
-            &ctx.provider,
-            false,
-        )
-        .await
+        match forwarder
+            .forward_once(
+                &ctx.app_type,
+                method.clone(),
+                endpoint,
+                continued_body.clone(),
+                headers.clone(),
+                extensions.clone(),
+                &ctx.provider,
+                false,
+            )
+            .await
         {
-            Ok((continued_response, _pid, _model, _ext)) => {
+            Ok((continued_response, _pid, _model)) => {
                 response = continued_response;
                 // 实际发出的是 advisor_tool_result 回注版，转录随之更新
                 current_body = continued_body;
@@ -800,18 +888,18 @@ pub async fn run_advisor_loop(
                     &assistant_message,
                     &fallback_message,
                 );
-                let (fallback_response, _pid, _model, _ext) = forward_once(
-                    forwarder,
-                    &ctx.app_type,
-                    method.clone(),
-                    endpoint,
-                    fallback_body.clone(),
-                    headers.clone(),
-                    extensions.clone(),
-                    &ctx.provider,
-                    false,
-                )
-                .await?;
+                let (fallback_response, _pid, _model) = forwarder
+                    .forward_once(
+                        &ctx.app_type,
+                        method.clone(),
+                        endpoint,
+                        fallback_body.clone(),
+                        headers.clone(),
+                        extensions.clone(),
+                        &ctx.provider,
+                        false,
+                    )
+                    .await?;
                 response = fallback_response;
                 // 实际发出的是 tool_result 回注版，转录随之更新
                 current_body = fallback_body;
@@ -845,7 +933,8 @@ pub async fn run_advisor_loop(
     Ok(AdvisorLoopOutcome::Completed {
         headers: headers_out,
         status,
-        body: response_json,
+        // 合并前序 advisor 帧的 executor 文本（review #27 F08）。
+        body: merge_pre_advisor_text(response_json, &pre_advisor_text),
     })
 }
 
@@ -1114,6 +1203,66 @@ mod tests {
         assert_eq!(extract_advisor_text(&json!({})), None);
     }
 
+    // ── advisor 前文本累积/合并（review #27 F08）──
+
+    #[test]
+    fn extract_text_blocks_collects_only_text() {
+        let resp = json!({"content": [
+            {"type": "thinking", "thinking": "hmm"},
+            {"type": "text", "text": "pre-advisor reasoning"},
+            {"type": "tool_use", "id": "toolu_01", "name": "advisor", "input": {}},
+            {"type": "text", "text": "more text"}
+        ]});
+        let blocks = extract_text_blocks(&resp);
+        let texts: Vec<&str> = blocks
+            .iter()
+            .map(|b| b["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, vec!["pre-advisor reasoning", "more text"]);
+    }
+
+    #[test]
+    fn extract_text_blocks_handles_missing_content() {
+        assert!(extract_text_blocks(&json!({})).is_empty());
+        assert!(extract_text_blocks(&json!({"content": "plain string"})).is_empty());
+    }
+
+    #[test]
+    fn merge_pre_advisor_text_prepends_and_preserves_final() {
+        let accumulated = vec![
+            json!({"type": "text", "text": "pre-advisor reasoning"}),
+        ];
+        let final_body = json!({
+            "content": [{"type": "text", "text": "final answer"}],
+            "stop_reason": "end_turn",
+            "id": "msg_01"
+        });
+        let merged = merge_pre_advisor_text(final_body, &accumulated);
+        let texts: Vec<&str> = merged["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, vec!["pre-advisor reasoning", "final answer"]);
+        // 最终帧的非 content 字段保持不变
+        assert_eq!(merged["stop_reason"], "end_turn");
+        assert_eq!(merged["id"], "msg_01");
+    }
+
+    #[test]
+    fn merge_pre_advisor_text_noop_when_empty_or_no_content() {
+        let final_body = json!({"content": [{"type": "text", "text": "x"}]});
+        // 累积为空 → 原样返回（常见无 advisor 路径）
+        assert_eq!(merge_pre_advisor_text(final_body.clone(), &[]), final_body);
+        // 最终体无 content 数组 → 不强行合成、原样返回
+        let no_content = json!({"stop_reason": "end_turn"});
+        assert_eq!(
+            merge_pre_advisor_text(no_content.clone(), &[json!({"type": "text", "text": "y"})]),
+            no_content
+        );
+    }
+
     // ── 回注体构造 ──
     #[test]
     fn builds_advisor_result_injection() {
@@ -1251,15 +1400,34 @@ mod tests {
 
     #[test]
     fn advisor_model_falls_back_to_executor_model_when_tier_unconfigured() {
-        // sonnet 档未配置 → 回落 executor 请求模型原值，映射后=executor 已映射模型
+        // 纯档位别名（裸 "sonnet"，非具体 ID）且该档未配映射 → 回落 executor 请求模型
         let provider = provider_with_model_mapping(); // 只有 fable/opus/default
+        let capture = AdvisorToolCapture {
+            model: Some("sonnet".to_string()),
+            max_uses: None,
+            max_tokens: None,
+        };
+        assert_eq!(
+            resolve_advisor_model(&capture, &provider, "claude-opus-4-8"),
+            "claude-opus-4-8"
+        );
+    }
+
+    #[test]
+    fn concrete_advisor_model_id_passes_through_unconfigured_tier() {
+        // review #27 F09：具体模型 ID（claude-sonnet-4-5）即便 sonnet 档未配映射，
+        // 也不应被档位判定丢弃改用 executor 模型——交由 forwarder 管线的 model_mapper
+        // 与 executor 一致处理（命中档则映射、否则原样透传给接受该模型的端点）。
+        let provider = provider_with_model_mapping(); // fable/opus/default 已配，sonnet 未配
         let capture = AdvisorToolCapture {
             model: Some("claude-sonnet-4-5".to_string()),
             max_uses: None,
             max_tokens: None,
         };
+        // 修复前：contains("sonnet") + sonnet 未配 → 丢弃、回落 executor "claude-opus-4-8"（错）
+        // 修复后：claude- 前缀具体 ID 放行 → 返回原值，由管线映射
         assert_eq!(
-            resolve_advisor_model(&capture, &provider, "claude-sonnet-4-5"),
+            resolve_advisor_model(&capture, &provider, "claude-opus-4-8"),
             "claude-sonnet-4-5"
         );
     }
@@ -1310,5 +1478,144 @@ mod tests {
         strip_advisor_beta_header(&mut headers);
         let values: Vec<&str> = headers.get_all("anthropic-beta").iter().filter_map(|v| v.to_str().ok()).collect();
         assert_eq!(values, vec!["claude-code-20250219"]);
+    }
+
+    // ── 回路编排（review #27 F08：advisor 前文本到达客户端）──
+
+    /// 按脚本返回响应的 stub forwarder（不发网络）。
+    /// - 子调用（is_advisor_subcall=true）→ 固定建议文本
+    /// - 续跑（is_advisor_subcall=false）→ 按调用序返回脚本帧
+    struct ScriptedForwarder {
+        continuations: std::sync::Mutex<Vec<Value>>,
+        adv_calls: std::sync::atomic::AtomicUsize,
+        cont_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AdvisorForwarder for ScriptedForwarder {
+        #[allow(clippy::too_many_arguments)]
+        fn forward_once(
+            &self,
+            _app_type: &AppType,
+            _method: http::Method,
+            _endpoint: &str,
+            _body: Value,
+            _headers: axum::http::HeaderMap,
+            _extensions: http::Extensions,
+            _provider: &Provider,
+            is_advisor_subcall: bool,
+        ) -> impl std::future::Future<Output = Result<(ProxyResponse, String, String), ProxyError>> + Send
+        {
+            let body = if is_advisor_subcall {
+                self.adv_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                json!({"content":[{"type":"text","text":"advisor advice"}]})
+            } else {
+                self.cont_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // 弹出下一个脚本帧；耗尽则给一个无 advisor 的收尾帧
+                self.continuations.lock().unwrap().pop().unwrap_or_else(|| {
+                    json!({"content":[{"type":"text","text":"final answer"}],"stop_reason":"end_turn"})
+                })
+            };
+            let bytes = serde_json::to_vec(&body).unwrap();
+            async move {
+                Ok((
+                    ProxyResponse::buffered(
+                        http::StatusCode::OK,
+                        axum::http::HeaderMap::new(),
+                        bytes::Bytes::from(bytes),
+                    ),
+                    "stub".to_string(),
+                    "stub-model".to_string(),
+                ))
+            }
+        }
+    }
+
+    fn buffered_json(body: Value) -> ProxyResponse {
+        let bytes = serde_json::to_vec(&body).unwrap();
+        ProxyResponse::buffered(
+            http::StatusCode::OK,
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::from(bytes),
+        )
+    }
+
+    #[tokio::test]
+    async fn advisor_loop_preserves_pre_advisor_text() {
+        // review #27 F08：executor 在 advisor 调用前产出的文本必须到达客户端。
+        // 首帧 [text1, advisor tool_use] → 子调用 → 续跑帧 [text2]（无 advisor）→
+        // 最终响应 content 应含 [text1, text2]（累积前文本 + 最终帧）。
+        let provider = Provider::with_id(
+            "p".into(),
+            "P".into(),
+            json!({"env":{"ANTHROPIC_BASE_URL":"https://k3.example.com"}}),
+            None,
+        );
+        let ctx =
+            crate::proxy::handler_context::RequestContext::for_test(provider, "claude-sonnet-4-5", AppType::Claude);
+
+        // 续跑帧：仅最终文本、无 advisor tool_use → 回路在此终止
+        let forwarder = ScriptedForwarder {
+            continuations: std::sync::Mutex::new(vec![json!({
+                "content":[{"type":"text","text":"final answer"}],
+                "stop_reason":"end_turn"
+            })]),
+            adv_calls: std::sync::atomic::AtomicUsize::new(0),
+            cont_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        // 首帧（传入 run_advisor_loop 的 response 参数）：advisor 调用前文本 + tool_use
+        let first_response = buffered_json(json!({
+            "content":[
+                {"type":"text","text":"pre-advisor reasoning"},
+                {"type":"tool_use","id":"toolu_01","name":"advisor","input":{}}
+            ],
+            "stop_reason":"tool_use"
+        }));
+
+        let rewritten_body = json!({
+            "model":"claude-sonnet-4-5",
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"name":"advisor","input_schema":{"type":"object","properties":{},"required":[]}}]
+        });
+        let capture = AdvisorToolCapture::default();
+
+        let outcome = run_advisor_loop(
+            &ctx,
+            &forwarder,
+            http::Method::POST,
+            "/v1/messages",
+            axum::http::HeaderMap::new(),
+            http::Extensions::new(),
+            &rewritten_body,
+            capture,
+            first_response,
+        )
+        .await
+        .expect("advisor loop 应正常完成");
+
+        // 终止帧无 advisor → NoAdvisorCall；但前序有 advisor，body 应已合并前文本
+        let response = match outcome {
+            AdvisorLoopOutcome::NoAdvisorCall { response } => response,
+            AdvisorLoopOutcome::Completed { body, .. } => {
+                // 兜底：若走 Completed，body 已是 Value
+                let texts: Vec<&str> = body["content"].as_array().unwrap().iter()
+                    .filter_map(|b| if b["type"] == "text" { b["text"].as_str() } else { None }).collect();
+                assert_eq!(texts, vec!["pre-advisor reasoning", "final answer"]);
+                return;
+            }
+        };
+        let (_, _, body_bytes) = crate::proxy::response_processor::read_decoded_body(
+            response,
+            "Advisor",
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let v: Value = serde_json::from_slice(&body_bytes).unwrap();
+        let texts: Vec<&str> = v["content"].as_array().unwrap().iter()
+            .filter_map(|b| if b["type"] == "text" { b["text"].as_str() } else { None }).collect();
+        assert_eq!(texts, vec!["pre-advisor reasoning", "final answer"]);
     }
 }

@@ -299,6 +299,46 @@ pub(crate) fn extract_gemini_model_from_path(endpoint: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+impl RequestContext {
+    /// 构造最小可用 ctx（advisor 回路单测用，review #27 F08 测试 seam）。
+    ///
+    /// auto_failover 关、各超时 0——buffered 响应读取不依赖超时；熔断/路由等
+    /// forwarder 内部依赖在 stub forwarder 路径下不会被触及，故填零值即可。
+    pub(crate) fn for_test(provider: Provider, request_model: &str, app_type: AppType) -> Self {
+        Self {
+            start_time: Instant::now(),
+            app_config: AppProxyConfig {
+                app_type: "claude".to_string(),
+                enabled: true,
+                auto_failover_enabled: false,
+                max_retries: 0,
+                streaming_first_byte_timeout: 0,
+                streaming_idle_timeout: 0,
+                non_streaming_timeout: 0,
+                circuit_failure_threshold: 0,
+                circuit_success_threshold: 0,
+                circuit_timeout_seconds: 0,
+                circuit_error_rate_threshold: 0.0,
+                circuit_min_requests: 0,
+            },
+            provider: provider.clone(),
+            providers: vec![provider],
+            current_provider_id: String::new(),
+            request_model: request_model.to_string(),
+            outbound_model: None,
+            tag: "Advisor",
+            app_type_str: "claude",
+            app_type,
+            session_id: String::new(),
+            session_client_provided: false,
+            rectifier_config: RectifierConfig::default(),
+            optimizer_config: OptimizerConfig::default(),
+            copilot_optimizer_config: CopilotOptimizerConfig::default(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::extract_gemini_model_from_path;
 
