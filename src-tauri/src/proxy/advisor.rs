@@ -26,10 +26,28 @@ use crate::provider::Provider;
 use crate::proxy::{
     forwarder::{ForwardError, RequestForwarder},
     handler_context::RequestContext,
-    hyper_client::ProxyResponse,
+    hyper_client::{ProxyResponse, MAX_RESPONSE_BODY_BYTES},
     ProxyError,
 };
 use serde_json::{json, Value};
+
+/// text 块的 UTF-8 字节直和（`text` 字段长度；非 text 块不计）。
+///
+/// 是合并进响应体的增量下界（真实合并体 ≥ 此值），按它判超限是保守方向
+/// （review #28 C3：回路累积多帧前文本时限制聚合字节，防各帧各自 ≤ 上限
+/// 但合计无界地驻留内存）。
+pub fn text_blocks_byte_len(blocks: &[Value]) -> usize {
+    blocks
+        .iter()
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .map(str::len)
+        .sum()
+}
+
+/// 已累积字节加上新帧字节是否超过响应体上限（review #28 C3）。
+pub fn exceeds_response_limit(accumulated: usize, incoming: usize, limit: usize) -> bool {
+    accumulated.saturating_add(incoming) > limit
+}
 
 /// Claude Code 客户端发来的 advisor 服务器工具块 type。
 pub const ADVISOR_SERVER_TOOL_TYPE: &str = "advisor_20260301";
@@ -430,10 +448,16 @@ pub fn extract_text_blocks(response: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// 把累积的 advisor 前文本块前置进最终响应体的 content（review #27 F08）。
+/// 把累积的 advisor 前文本块合并进最终响应体的 content（review #27 F08）。
+///
+/// 插入点在最终帧**开头的连续 `thinking`/`redacted_thinking` 块之后**（review
+/// #28 C2）：客户端会把 assistant 响应 round-trip 回下一轮请求历史，开启
+/// extended thinking 的 assistant 消息必须以 thinking 块开头，否则严格端点
+/// 400（"must start with a thinking block"——thinking_rectifier 场景 2 处理的
+/// 同一真实端点错误）。无 thinking 开头时等价于前置（常见路径）。
 ///
 /// 累积为空 → 原样返回（no-op，保护常见无 advisor 路径）。最终体无 content 数组
-/// （非 Messages 响应体）→ 不强行合成、原样返回。仅前置 text 块；最终帧自身的
+/// （非 Messages 响应体）→ 不强行合成、原样返回。仅合并 text 块；最终帧自身的
 /// content（其文本 / 客户端已知的 tool_use）保持顺序在后。
 pub fn merge_pre_advisor_text(mut final_body: Value, accumulated_text: &[Value]) -> Value {
     if accumulated_text.is_empty() {
@@ -442,8 +466,20 @@ pub fn merge_pre_advisor_text(mut final_body: Value, accumulated_text: &[Value])
     let Some(arr) = final_body.get("content").and_then(Value::as_array) else {
         return final_body;
     };
-    let mut merged: Vec<Value> = accumulated_text.to_vec();
-    merged.extend(arr.iter().cloned());
+    // 最终帧开头的连续 thinking 块保持在前（协议约束：thinking 须居首）
+    let leading_thinking = arr
+        .iter()
+        .take_while(|b| {
+            matches!(
+                b.get("type").and_then(Value::as_str),
+                Some("thinking") | Some("redacted_thinking")
+            )
+        })
+        .count();
+    let mut merged: Vec<Value> = Vec::with_capacity(accumulated_text.len() + arr.len());
+    merged.extend(arr[..leading_thinking].iter().cloned());
+    merged.extend(accumulated_text.iter().cloned());
+    merged.extend(arr[leading_thinking..].iter().cloned());
     final_body["content"] = Value::Array(merged);
     final_body
 }
@@ -727,8 +763,11 @@ pub async fn run_advisor_loop<F: AdvisorForwarder>(
     let mut current_body = rewritten_body.clone();
     // 累积每个被消费的 advisor 帧（含 advisor tool_use 那一帧）里的 executor 文本——
     // 这些文本在官方服务端 advisor 流程里会到达客户端（issue-5 §5/§8），本地回路
-    // 只回最后一帧会丢失它（review #27 F08）。回路结束时前置合并进最终响应。
+    // 只回最后一帧会丢失它（review #27 F08）。回路结束时合并进最终响应。
     let mut pre_advisor_text: Vec<Value> = Vec::new();
+    // 累积字节计数（review #28 C3）：各帧各自过 bytes_with_limit，但累积本身
+    // 需限制聚合字节，防多帧近上限响应合计无界驻留内存。
+    let mut pre_advisor_bytes: usize = 0;
     let mut iterations = 0usize;
 
     loop {
@@ -748,7 +787,7 @@ pub async fn run_advisor_loop<F: AdvisorForwarder>(
             } else {
                 std::time::Duration::ZERO
             };
-        let (response_headers, status, body_bytes) =
+        let (mut response_headers, status, body_bytes) =
             super::response_processor::read_decoded_body(response, ctx.tag, body_timeout)
                 .await?;
 
@@ -787,7 +826,24 @@ pub async fn run_advisor_loop<F: AdvisorForwarder>(
             let body_bytes = if pre_advisor_text.is_empty() {
                 body_bytes
             } else {
+                // 合并前：累积 + 最终帧字节的合计上限（review #28 C3）——各帧各自
+                // ≤ MAX 但累积 + 最终帧仍可能近 2×MAX，合并体与序列化副本会成倍
+                // 放大驻留内存。
+                if exceeds_response_limit(
+                    pre_advisor_bytes,
+                    body_bytes.len(),
+                    MAX_RESPONSE_BODY_BYTES,
+                ) {
+                    return Err(ProxyError::ResponseBodyTooLarge(MAX_RESPONSE_BODY_BYTES));
+                }
                 let merged = merge_pre_advisor_text(response_json, &pre_advisor_text);
+                // 重建了 body → 剥实体头（review #28 C1）：残留的 content-length
+                // 描述旧 body，handle_non_streaming 只剥 hop-by-hop、会原样转发它，
+                // 客户端按旧长度截断收到不完整 JSON。与 read_decoded_body 解压后、
+                // build_json_response 重建后剥头是同一模式。
+                super::response_processor::strip_entity_headers_for_rebuilt_body(
+                    &mut response_headers,
+                );
                 bytes::Bytes::from(
                     serde_json::to_vec(&merged).unwrap_or_else(|_| body_bytes.to_vec()),
                 )
@@ -798,8 +854,15 @@ pub async fn run_advisor_loop<F: AdvisorForwarder>(
         }
 
         // 本帧含 advisor tool_use、即将被消费：累积其 executor 文本（advisor 调用前
-        // 的部分），回路结束时前置合并进最终响应（review #27 F08）。
-        pre_advisor_text.extend(extract_text_blocks(&response_json));
+        // 的部分），回路结束时合并进最终响应（review #27 F08）。累积字节超限即失败
+        // （review #28 C3）——与单帧超限（bytes_with_limit）同语义。
+        let frame_text = extract_text_blocks(&response_json);
+        let frame_bytes = text_blocks_byte_len(&frame_text);
+        if exceeds_response_limit(pre_advisor_bytes, frame_bytes, MAX_RESPONSE_BODY_BYTES) {
+            return Err(ProxyError::ResponseBodyTooLarge(MAX_RESPONSE_BODY_BYTES));
+        }
+        pre_advisor_bytes += frame_bytes;
+        pre_advisor_text.extend(frame_text);
 
         // 判定通过 → 必定能取到 advisor tool_use 块
         let tool_use = find_advisor_tool_use(&response_json)
@@ -1487,6 +1550,8 @@ mod tests {
     /// - 续跑（is_advisor_subcall=false）→ 按调用序返回脚本帧
     struct ScriptedForwarder {
         continuations: std::sync::Mutex<Vec<Value>>,
+        /// 续跑帧响应携带的头（如上游 content-length，C1 复现用）
+        cont_headers: std::sync::Mutex<Vec<axum::http::HeaderMap>>,
         adv_calls: std::sync::atomic::AtomicUsize,
         cont_calls: std::sync::atomic::AtomicUsize,
     }
@@ -1517,12 +1582,17 @@ mod tests {
                     json!({"content":[{"type":"text","text":"final answer"}],"stop_reason":"end_turn"})
                 })
             };
+            let headers = if is_advisor_subcall {
+                axum::http::HeaderMap::new()
+            } else {
+                self.cont_headers.lock().unwrap().pop().unwrap_or_default()
+            };
             let bytes = serde_json::to_vec(&body).unwrap();
             async move {
                 Ok((
                     ProxyResponse::buffered(
                         http::StatusCode::OK,
-                        axum::http::HeaderMap::new(),
+                        headers,
                         bytes::Bytes::from(bytes),
                     ),
                     "stub".to_string(),
@@ -1561,6 +1631,7 @@ mod tests {
                 "content":[{"type":"text","text":"final answer"}],
                 "stop_reason":"end_turn"
             })]),
+            cont_headers: std::sync::Mutex::new(vec![]),
             adv_calls: std::sync::atomic::AtomicUsize::new(0),
             cont_calls: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -1617,5 +1688,195 @@ mod tests {
         let texts: Vec<&str> = v["content"].as_array().unwrap().iter()
             .filter_map(|b| if b["type"] == "text" { b["text"].as_str() } else { None }).collect();
         assert_eq!(texts, vec!["pre-advisor reasoning", "final answer"]);
+    }
+
+    /// C1（codex review #28）：合并重建 body 后不得残留过期实体头。
+    ///
+    /// 上游最终帧响应带 `Content-Length: <最终帧长度>`；回路把前序 advisor 帧的
+    /// 文本合并进 body 后长度变大，若原样复用旧头，客户端收到的 Content-Length
+    /// 描述的是旧 body（截断/协议错误）。重建 body 处必须剥实体头（与
+    /// `read_decoded_body` 解压后剥头、`build_json_response` 重建后剥头同一模式）。
+    #[tokio::test]
+    async fn advisor_loop_merged_body_strips_stale_entity_headers() {
+        let provider = Provider::with_id(
+            "p".into(),
+            "P".into(),
+            json!({"env":{"ANTHROPIC_BASE_URL":"https://k3.example.com"}}),
+            None,
+        );
+        let ctx =
+            crate::proxy::handler_context::RequestContext::for_test(provider, "claude-sonnet-4-5", AppType::Claude);
+
+        // 续跑帧（最终帧）：上游带 content-length = 该帧自身的序列化长度
+        let final_frame = json!({
+            "content":[{"type":"text","text":"final answer"}],
+            "stop_reason":"end_turn"
+        });
+        let final_frame_len = serde_json::to_vec(&final_frame).unwrap().len();
+        let mut upstream_headers = axum::http::HeaderMap::new();
+        upstream_headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(final_frame_len),
+        );
+
+        let forwarder = ScriptedForwarder {
+            continuations: std::sync::Mutex::new(vec![final_frame]),
+            cont_headers: std::sync::Mutex::new(vec![upstream_headers]),
+            adv_calls: std::sync::atomic::AtomicUsize::new(0),
+            cont_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        // 首帧：advisor 调用前文本 + tool_use
+        let first_response = buffered_json(json!({
+            "content":[
+                {"type":"text","text":"pre-advisor reasoning"},
+                {"type":"tool_use","id":"toolu_01","name":"advisor","input":{}}
+            ],
+            "stop_reason":"tool_use"
+        }));
+
+        let rewritten_body = json!({
+            "model":"claude-sonnet-4-5",
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"name":"advisor","input_schema":{"type":"object","properties":{},"required":[]}}]
+        });
+
+        let outcome = run_advisor_loop(
+            &ctx,
+            &forwarder,
+            http::Method::POST,
+            "/v1/messages",
+            axum::http::HeaderMap::new(),
+            http::Extensions::new(),
+            &rewritten_body,
+            AdvisorToolCapture::default(),
+            first_response,
+        )
+        .await
+        .expect("advisor loop 应正常完成");
+
+        let response = match outcome {
+            AdvisorLoopOutcome::NoAdvisorCall { response } => response,
+            AdvisorLoopOutcome::Completed { .. } => panic!("终止帧无 advisor 调用，应为 NoAdvisorCall"),
+        };
+
+        // 先取头快照（read_decoded_body 按值消费 response）
+        let out_headers = response.headers().clone();
+
+        // body 确已合并重建（长度大于旧 content-length）
+        let (_, _, body_bytes) = crate::proxy::response_processor::read_decoded_body(
+            response,
+            "Advisor",
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert!(
+            body_bytes.len() > final_frame_len,
+            "合并后 body 应大于最终帧原长度"
+        );
+        let v: Value = serde_json::from_slice(&body_bytes).unwrap();
+        let texts: Vec<&str> = v["content"].as_array().unwrap().iter()
+            .filter_map(|b| if b["type"] == "text" { b["text"].as_str() } else { None }).collect();
+        assert_eq!(texts, vec!["pre-advisor reasoning", "final answer"]);
+
+        // 断言（红）：重建 body 的实体头必须剥掉——残留的 content-length 描述的是
+        // 旧 body，handle_non_streaming 会原样转发它（只剥 hop-by-hop），客户端
+        // 按 content-length 截断收到不完整 JSON。
+        assert!(
+            out_headers.get(axum::http::header::CONTENT_LENGTH).is_none(),
+            "合并重建 body 后不得残留过期 content-length，实际: {:?}",
+            out_headers.get(axum::http::header::CONTENT_LENGTH)
+        );
+    }
+
+    /// C2（codex review #28）：thinking 模式下，前置文本必须插到最终帧的
+    /// leading thinking 块之后，thinking 块保持在 content 首位。
+    ///
+    /// 客户端会把 assistant 响应 round-trip 回下一轮请求历史；开启 extended
+    /// thinking 的 assistant 消息必须以 thinking 块开头，否则严格端点 400
+    /// （"must start with a thinking block"——thinking_rectifier.rs 场景 2
+    /// 处理的同一真实端点错误）。
+    #[test]
+    fn merge_pre_advisor_text_keeps_leading_thinking_first() {
+        let accumulated = vec![json!({"type": "text", "text": "pre-advisor reasoning"})];
+        let final_body = json!({
+            "content": [
+                {"type": "thinking", "thinking": "internal reasoning", "signature": "sig"},
+                {"type": "text", "text": "final answer"}
+            ],
+            "stop_reason": "end_turn"
+        });
+        let merged = merge_pre_advisor_text(final_body, &accumulated);
+        let blocks = merged["content"].as_array().unwrap();
+        let types: Vec<&str> = blocks.iter().map(|b| b["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            vec!["thinking", "text", "text"],
+            "thinking 块必须保持在首位，前置文本插到其后"
+        );
+        let texts: Vec<&str> = blocks
+            .iter()
+            .filter(|b| b["type"] == "text")
+            .map(|b| b["text"].as_str().unwrap())
+            .collect();
+        // 时间顺序保持：pre-advisor 文本在前，最终帧文本在后
+        assert_eq!(texts, vec!["pre-advisor reasoning", "final answer"]);
+        // thinking 块本身不被改写
+        assert_eq!(blocks[0]["signature"], "sig");
+    }
+
+    /// C2 变体：redacted_thinking 开头同样保持在前。
+    #[test]
+    fn merge_pre_advisor_text_keeps_leading_redacted_thinking_first() {
+        let accumulated = vec![json!({"type": "text", "text": "pre"})];
+        let final_body = json!({
+            "content": [
+                {"type": "redacted_thinking", "data": "…"},
+                {"type": "text", "text": "final"}
+            ]
+        });
+        let merged = merge_pre_advisor_text(final_body, &accumulated);
+        let types: Vec<&str> = merged["content"].as_array().unwrap().iter()
+            .map(|b| b["type"].as_str().unwrap()).collect();
+        assert_eq!(types, vec!["redacted_thinking", "text", "text"]);
+    }
+
+    /// C2 无 thinking 时保持纯前置（常见路径不回归）。
+    #[test]
+    fn merge_pre_advisor_text_prepends_when_no_thinking() {
+        let accumulated = vec![json!({"type": "text", "text": "pre"})];
+        let final_body = json!({"content": [{"type": "text", "text": "final"}]});
+        let merged = merge_pre_advisor_text(final_body, &accumulated);
+        let texts: Vec<&str> = merged["content"].as_array().unwrap().iter()
+            .map(|b| b["text"].as_str().unwrap()).collect();
+        assert_eq!(texts, vec!["pre", "final"]);
+    }
+
+    /// C3（codex review #28）：text 块字节数（UTF-8 text 字段直和，非 text 块不计）。
+    #[test]
+    fn text_blocks_byte_len_sums_utf8_text_bytes() {
+        let blocks = vec![
+            json!({"type": "text", "text": "hello"}), // 5 字节
+            json!({"type": "text", "text": "你好"}),   // 6 字节（UTF-8 每汉字 3 字节）
+            json!({"type": "thinking", "thinking": "不计入"}), // 非 text 块不计
+        ];
+        assert_eq!(text_blocks_byte_len(&blocks), 11);
+        assert_eq!(text_blocks_byte_len(&[]), 0);
+    }
+
+    /// C3（codex review #28）：累积 + 新帧字节超过响应体上限 → 超限。
+    /// （回路里用它防多帧各自 ≤128 MiB 但合计无界的累积。）
+    #[test]
+    fn accumulated_pre_advisor_text_enforces_aggregate_limit() {
+        use super::MAX_RESPONSE_BODY_BYTES as LIMIT;
+        // 边界：恰好等于上限不触发（> 判定）
+        assert!(!exceeds_response_limit(LIMIT - 10, 10, LIMIT));
+        // 超过上限触发
+        assert!(exceeds_response_limit(LIMIT - 10, 11, LIMIT));
+        // 已累积超限后再来任意帧都触发
+        assert!(exceeds_response_limit(LIMIT + 1, 0, LIMIT));
+        // usize 溢出安全（saturating）
+        assert!(exceeds_response_limit(usize::MAX, 1, LIMIT));
     }
 }
