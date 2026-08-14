@@ -69,31 +69,9 @@ impl ModelMapping {
     pub fn map_model(&self, original_model: &str) -> String {
         let model_lower = original_model.to_lowercase();
 
-        // 1. 按模型类型匹配
-        if model_lower.contains("fable") {
-            if let Some(ref m) = self.fable_model {
-                return m.clone();
-            }
-            // 未单独配置 fable 档时归入 opus 档，与 Claude Code 官方
-            // 分类器降级方向一致（fable→opus），避免落到 default 失去层级。
-            if let Some(ref m) = self.opus_model {
-                return m.clone();
-            }
-        }
-        if model_lower.contains("haiku") {
-            if let Some(ref m) = self.haiku_model {
-                return m.clone();
-            }
-        }
-        if model_lower.contains("opus") {
-            if let Some(ref m) = self.opus_model {
-                return m.clone();
-            }
-        }
-        if model_lower.contains("sonnet") {
-            if let Some(ref m) = self.sonnet_model {
-                return m.clone();
-            }
+        // 1. 按模型类型匹配（档位级联，与 advisor 模型解析共享）
+        if let Some(m) = self.tier_match(&model_lower) {
+            return m.clone();
         }
 
         if let Some(ref m) = self.subagent_model {
@@ -110,6 +88,40 @@ impl ModelMapping {
 
         // 3. 无映射，保持原样
         original_model.to_string()
+    }
+
+    /// 按档位关键词匹配已配置的映射模型（fable 档未配时归入 opus 档）。
+    ///
+    /// 返回该档位已配置的模型；无档位关键词命中、或命中的档未配置时返回 `None`（由
+    /// 调用方决定回落：`map_model` 继续落 default/原名，advisor 落 executor 已映射模型）。
+    /// 与 `map_model` 的档位级联同序同语义，抽出供 advisor 模型解析复用。
+    pub(crate) fn tier_match(&self, model_lower: &str) -> Option<&String> {
+        if model_lower.contains("fable") {
+            if let Some(ref m) = self.fable_model {
+                return Some(m);
+            }
+            // 未单独配置 fable 档时归入 opus 档，与 Claude Code 官方
+            // 分类器降级方向一致（fable→opus），避免落到 default 失去层级。
+            if let Some(ref m) = self.opus_model {
+                return Some(m);
+            }
+        }
+        if model_lower.contains("haiku") {
+            if let Some(ref m) = self.haiku_model {
+                return Some(m);
+            }
+        }
+        if model_lower.contains("opus") {
+            if let Some(ref m) = self.opus_model {
+                return Some(m);
+            }
+        }
+        if model_lower.contains("sonnet") {
+            if let Some(ref m) = self.sonnet_model {
+                return Some(m);
+            }
+        }
+        None
     }
 }
 

@@ -476,9 +476,26 @@ impl RequestForwarder {
                 status.current_provider_id = Some(provider.id.clone());
             }
 
+            // advisor 本地降级门控：Claude + anthropic 非流式 + /v1/messages + 第三方
+            // base_url + 含 advisor 服务器工具块 → 走 advisor 回路（failover 钉死本 Provider）。
+            let advisor_active = self.advisor_fallback_active(
+                app_type,
+                endpoint,
+                &provider_body,
+                &headers,
+                provider,
+                adapter.as_ref(),
+            );
+
+            // 注意：advisor 激活时，下方失败分支里的 media/thinking 三个整流器被
+            // `!advisor_active` 停用——它们改写的是**改写前**的 provider_body（仍含
+            // advisor server 块）并经 `forward()` 重发，会绕过 advisor 回路把未剥离的
+            // 块发出去。代价：advisor 会话内命中 thinking 类 400 不再自动整流重试
+            // （属切片 1 错误路径的可接受限制，随切片 2 错误降级统一处理）。
+
             // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
-            match self
-                .forward(
+            let attempt = if advisor_active {
+                self.forward_with_advisor_loop(
                     app_type,
                     &method,
                     provider,
@@ -489,7 +506,20 @@ impl RequestForwarder {
                     adapter.as_ref(),
                 )
                 .await
-            {
+            } else {
+                self.forward(
+                    app_type,
+                    &method,
+                    provider,
+                    endpoint,
+                    &provider_body,
+                    &headers,
+                    &extensions,
+                    adapter.as_ref(),
+                )
+                .await
+            };
+            match attempt {
                 Ok((response, claude_api_format, outbound_model)) => {
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
@@ -551,12 +581,14 @@ impl RequestForwarder {
                     );
                     let mut signature_rectifier_non_retryable_client_error = false;
 
-                    if self.media_retry_should_trigger(
-                        adapter.name(),
-                        media_rectifier_retried,
-                        &provider_body,
-                        &e,
-                    ) {
+                    if !advisor_active
+                        && self.media_retry_should_trigger(
+                            adapter.name(),
+                            media_rectifier_retried,
+                            &provider_body,
+                            &e,
+                        )
+                    {
                         let mut media_body = provider_body.clone();
                         let replaced_images =
                             super::media_sanitizer::replace_image_blocks_with_marker(
@@ -671,10 +703,12 @@ impl RequestForwarder {
 
                     if is_anthropic_provider {
                         let error_message = extract_error_message(&e);
-                        if should_rectify_thinking_signature(
-                            error_message.as_deref(),
-                            &self.rectifier_config,
-                        ) {
+                        if !advisor_active
+                            && should_rectify_thinking_signature(
+                                error_message.as_deref(),
+                                &self.rectifier_config,
+                            )
+                        {
                             // 已经重试过：直接返回错误（不可重试客户端错误）
                             if rectifier_retried {
                                 log::warn!("[{app_type_str}] [RECT-005] 整流器已触发过，不再重试");
@@ -822,10 +856,12 @@ impl RequestForwarder {
                     // 检测是否需要触发 budget 整流器（仅 Claude/ClaudeAuth 供应商）
                     if is_anthropic_provider {
                         let error_message = extract_error_message(&e);
-                        if should_rectify_thinking_budget(
-                            error_message.as_deref(),
-                            &self.rectifier_config,
-                        ) {
+                        if !advisor_active
+                            && should_rectify_thinking_budget(
+                                error_message.as_deref(),
+                                &self.rectifier_config,
+                            )
+                        {
                             // 已经重试过：直接返回错误（不可重试客户端错误）
                             if budget_rectifier_retried {
                                 log::warn!(
@@ -1123,6 +1159,30 @@ impl RequestForwarder {
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+        self.forward_inner(
+            app_type, method, provider, endpoint, body, headers, extensions, adapter, false,
+        )
+        .await
+    }
+
+    /// `forward` 的实现本体。
+    ///
+    /// `skip_model_mapping` 用于「模型已预解析」的调用（如 advisor 子调用）：跳过
+    /// `apply_model_mapping`，避免对最终模型名二次映射（预解析值不含档位关键词时，
+    /// 二次映射会错落到 default）。其余定稿（[1m] 剥离、thinking 归一等）照常。
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_inner(
+        &self,
+        app_type: &AppType,
+        method: &http::Method,
+        provider: &Provider,
+        endpoint: &str,
+        body: &Value,
+        headers: &axum::http::HeaderMap,
+        extensions: &Extensions,
+        adapter: &dyn ProviderAdapter,
+        skip_model_mapping: bool,
+    ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
         // 使用适配器提取 base_url
         let mut base_url = adapter.extract_base_url(provider)?;
 
@@ -1159,7 +1219,10 @@ impl RequestForwarder {
         // 应用模型映射（独立于格式转换）
         // Claude Desktop proxy 模式必须先把 Desktop 可见的 claude-* route
         // 映射成真实上游模型名，并且未知 route 要直接报错，不能使用默认模型兜底。
-        let mapped_body = if matches!(app_type, AppType::ClaudeDesktop) {
+        let mapped_body = if skip_model_mapping {
+            // 模型已预解析（advisor 子调用）：直接使用请求体里的模型，不再二次映射。
+            body.clone()
+        } else if matches!(app_type, AppType::ClaudeDesktop) {
             crate::claude_desktop_config::map_proxy_request_model(body.clone(), provider)
                 .map_err(|e| ProxyError::InvalidRequest(e.to_string()))?
         } else {
@@ -2338,6 +2401,299 @@ impl RequestForwarder {
         }
     }
 
+    /// advisor 本地降级门控（纯判定）。
+    ///
+    /// 命中全部条件才走本地降级回路；任一不满足则普通 forward：
+    /// - 仅 Claude Code 场景（app_type == Claude）且端点为 /v1/messages；
+    /// - 非流式（流式属切片 6）；
+    /// - anthropic 原生透传（需格式转换的端点不适用客户端工具降级）；
+    /// - 第三方 base_url（官方域透传原生 advisor，不降级）；
+    /// - 请求体含 `advisor_20260301` 服务器工具块。
+    fn advisor_fallback_active(
+        &self,
+        app_type: &AppType,
+        endpoint: &str,
+        body: &Value,
+        headers: &axum::http::HeaderMap,
+        provider: &Provider,
+        adapter: &dyn ProviderAdapter,
+    ) -> bool {
+        if !matches!(app_type, AppType::Claude) {
+            return false;
+        }
+        if !is_claude_messages_path(endpoint) {
+            return false;
+        }
+        if is_streaming_request(endpoint, body, headers) {
+            return false;
+        }
+        // 切片 1 只覆盖 anthropic 透传端点（块形状 advisor_tool_result/tool_use 是
+        // anthropic 契约）；需格式转换的 openai_chat/openai_responses 网关的 advisor
+        // 降级须走 OpenAI function 模型，是另一个更难的子问题，属后续切片。
+        if adapter.needs_transform(provider) {
+            return false;
+        }
+        let Ok(base_url) = adapter.extract_base_url(provider) else {
+            return false;
+        };
+        if !super::advisor::should_local_fallback(&base_url) {
+            return false;
+        }
+        super::advisor::has_advisor_tool(body)
+    }
+
+    /// advisor 本地降级回路（非流式成功路径，issue #21 切片 1）。
+    ///
+    /// 一次客户端请求内部：改写请求（剥 advisor server 块、注入客户端工具、剥 beta 头）
+    /// → forward 给 executor → 若捕获 advisor `tool_use` 则起本地子调用取建议 → 回注 →
+    /// 续跑 executor → 循环直到 executor 不再调 advisor → 返回最终响应。整个 advisor
+    /// 往返对客户端透明（客户端只看到一次请求-响应）。failover 钉死本 Provider（复用其
+    /// 端点/凭证，不重走 router）。
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_with_advisor_loop(
+        &self,
+        app_type: &AppType,
+        method: &http::Method,
+        provider: &Provider,
+        endpoint: &str,
+        body: &Value,
+        headers: &axum::http::HeaderMap,
+        extensions: &Extensions,
+        adapter: &dyn ProviderAdapter,
+    ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+        // 1. 请求侧改写：剥 advisor server 块 → 注入无参客户端工具 advisor。
+        let mut loop_body = body.clone();
+        let Some(capture) = super::advisor::rewrite_request(&mut loop_body) else {
+            // 门控已保证含 advisor 块；防御 None 则退化为单次 forward。
+            return self
+                .forward(
+                    app_type, method, provider, endpoint, body, headers, extensions, adapter,
+                )
+                .await;
+        };
+
+        // 2. 按值剥 advisor beta 头（本地用明文块变体，不依赖该头）。
+        let stripped_headers = super::advisor::strip_advisor_beta_from_headers(headers);
+
+        let mapping = super::model_mapper::ModelMapping::from_provider(provider);
+        let executor_max_tokens = loop_body
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_ADVISOR_MAX_TOKENS);
+
+        let mut use_tool_result_fallback = false;
+        // 最近一次尚未被下游确认接受的 advisor_tool_result 回注（仅该形状才可能被拒，
+        // 用于 advisor_tool_result → tool_result 回退）；tool_result 回注无回退对象，置 None。
+        let mut pending: Option<PendingInjection> = None;
+        let mut executor_mapped_model: Option<String> = None;
+
+        // 循环直到 executor 不再调 advisor（US-34：本地不自造上限）。转录每轮增长，
+        // executor 上下文溢出时其 forward 报错、回路随之终止，无真死循环。
+        loop {
+            let attempt = self
+                .forward(
+                    app_type,
+                    method,
+                    provider,
+                    endpoint,
+                    &loop_body,
+                    &stripped_headers,
+                    extensions,
+                    adapter,
+                )
+                .await;
+            let (response, claude_api_format, outbound_model) = match attempt {
+                Ok(ok) => ok,
+                Err(e) => {
+                    // 下游对 advisor_tool_result 未知块报错 → 回退普通 tool_result 重发一次。
+                    if !use_tool_result_fallback && is_advisor_block_rejection(&e) {
+                        if let Some(p) = pending.take() {
+                            use_tool_result_fallback = true;
+                            log::info!(
+                                "[Advisor] 下游拒绝 advisor_tool_result，回退普通 tool_result 重发"
+                            );
+                            if let Some(arr) =
+                                loop_body.get_mut("messages").and_then(Value::as_array_mut)
+                            {
+                                arr.truncate(p.base_len);
+                                arr.extend(super::advisor::build_continuation(
+                                    &p.assistant_content,
+                                    &p.tool_use_id,
+                                    &p.advice,
+                                    super::advisor::InjectShape::ToolResult,
+                                ));
+                            }
+                            continue;
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+
+            if executor_mapped_model.is_none() {
+                executor_mapped_model = outbound_model.clone().or_else(|| {
+                    loop_body
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                });
+            }
+
+            // 非流式 executor 响应应为 Buffered JSON；否则视为终态原样返回。
+            let Some(resp_json) = buffered_json(&response) else {
+                return Ok((response, claude_api_format, outbound_model));
+            };
+            // 无 advisor 调用 → 终态，把最终响应返给客户端（对客户端透明）。
+            let Some(call) = super::advisor::find_advisor_call(&resp_json) else {
+                return Ok((response, claude_api_format, outbound_model));
+            };
+
+            // 捕获到 advisor 调用 → 起本地子调用取建议（None = 子调用失败）。
+            let outcome = self
+                .run_advisor_subcall(
+                    app_type,
+                    method,
+                    provider,
+                    endpoint,
+                    &stripped_headers,
+                    extensions,
+                    adapter,
+                    &loop_body,
+                    &resp_json,
+                    &capture,
+                    &mapping,
+                    executor_mapped_model.as_deref(),
+                    executor_max_tokens,
+                )
+                .await;
+
+            // 构造回注（assistant 含 tool_use 的消息 + 下一条 user 消息）并 append 进 messages。
+            // 三分支（US-26 / 数据契约）：成功 → advisor_tool_result（下游拒绝过则回退
+            // tool_result）；子调用失败 → 一律普通 tool_result 明文「advisor 不可用」。
+            let assistant_content = resp_json.get("content").cloned().unwrap_or(Value::Null);
+            let (advice, shape) = match outcome {
+                Some(text) => {
+                    let shape = if use_tool_result_fallback {
+                        super::advisor::InjectShape::ToolResult
+                    } else {
+                        super::advisor::InjectShape::AdvisorToolResult
+                    };
+                    (text, shape)
+                }
+                None => (
+                    super::advisor::unavailable_advice(),
+                    super::advisor::InjectShape::ToolResult,
+                ),
+            };
+            let continuation =
+                super::advisor::build_continuation(&assistant_content, &call.id, &advice, shape);
+            let base_len = loop_body
+                .get("messages")
+                .and_then(Value::as_array)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if let Some(arr) = loop_body.get_mut("messages").and_then(Value::as_array_mut) {
+                arr.extend(continuation);
+            }
+            // 仅 advisor_tool_result 形状才可能被下游拒绝 → 记录 pending 以备回退。
+            pending = match shape {
+                super::advisor::InjectShape::AdvisorToolResult => Some(PendingInjection {
+                    base_len,
+                    assistant_content,
+                    tool_use_id: call.id,
+                    advice,
+                }),
+                super::advisor::InjectShape::ToolResult => None,
+            };
+            // 续跑 executor（进入下一轮 loop）。
+        }
+    }
+
+    /// 起一次 advisor 子调用，返回建议文本（`None` = 子调用失败或取不到有效建议）。
+    ///
+    /// Oracle 系统提示 + 完整转录 + 空 `tools`、`max_tokens` 沿用 executor、模型经
+    /// `model_mapper` 分档映射（未配该档回落 executor 已映射模型）。复用 forwarder
+    /// （熔断/用量记录）但跳过模型二次映射（模型已解析）。`None` 由调用方以普通
+    /// `tool_result` 明文「不可用」回注（最小安全网，不 5xx；六码归因属切片 2）。
+    #[allow(clippy::too_many_arguments)]
+    async fn run_advisor_subcall(
+        &self,
+        app_type: &AppType,
+        method: &http::Method,
+        provider: &Provider,
+        endpoint: &str,
+        headers: &axum::http::HeaderMap,
+        extensions: &Extensions,
+        adapter: &dyn ProviderAdapter,
+        loop_body: &Value,
+        executor_response: &Value,
+        capture: &super::advisor::AdvisorCapture,
+        mapping: &super::model_mapper::ModelMapping,
+        executor_mapped_model: Option<&str>,
+        executor_max_tokens: u64,
+    ) -> Option<String> {
+        let executor_model = executor_mapped_model
+            .map(str::to_string)
+            .or_else(|| {
+                loop_body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            })
+            .unwrap_or_default();
+        let advisor_model = super::advisor::resolve_advisor_model(
+            capture.model.as_deref(),
+            &executor_model,
+            mapping,
+        );
+
+        // 完整转录 = 既有 messages + 本轮 assistant 响应；本轮文本 = 响应里的 text 块。
+        let content = executor_response
+            .get("content")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let current_text = super::advisor::join_text_blocks(&content);
+        let mut conversation = loop_body
+            .get("messages")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
+        if let Some(arr) = conversation.as_array_mut() {
+            arr.push(serde_json::json!({ "role": "assistant", "content": content }));
+        }
+        let transcript = super::advisor::build_transcript(
+            loop_body.get("system"),
+            loop_body.get("tools"),
+            &conversation,
+            &current_text,
+        );
+        let subcall_body =
+            super::advisor::build_subcall_body(&advisor_model, executor_max_tokens, &transcript);
+
+        // 复用 forwarder 路径，跳过模型二次映射（模型已预解析）。
+        match self
+            .forward_inner(
+                app_type,
+                method,
+                provider,
+                endpoint,
+                &subcall_body,
+                headers,
+                extensions,
+                adapter,
+                true,
+            )
+            .await
+        {
+            Ok((resp, _, _)) => {
+                buffered_json(&resp).and_then(|j| super::advisor::extract_advice_text(&j))
+            }
+            Err(e) => {
+                log::warn!("[Advisor] 子调用失败，回注「不可用」让 executor 继续: {e}");
+                None
+            }
+        }
+    }
+
     /// 故障转移开启时，成功不能只看上游响应头。
     ///
     /// - 非流式：先把完整 body 读到内存，读超时/连接中断会回到 retry loop 尝试下一家。
@@ -2857,6 +3213,42 @@ fn strip_beta_query(query: Option<&str>) -> Option<String> {
 
 fn is_claude_messages_path(path: &str) -> bool {
     matches!(path, "/v1/messages" | "/claude/v1/messages")
+}
+
+/// executor 未提供 `max_tokens` 时 advisor 子调用的兜底值。
+/// （切片 1 沿用 executor 值；此仅为防御性兜底，正常 Claude Code 请求恒有 max_tokens。）
+const DEFAULT_ADVISOR_MAX_TOKENS: u64 = 8192;
+
+/// 读取非流式（Buffered）响应体并解析为 JSON；非 Buffered 或解析失败返回 None。
+fn buffered_json(response: &ProxyResponse) -> Option<Value> {
+    if let ProxyResponse::Buffered { body, .. } = response {
+        serde_json::from_slice(body).ok()
+    } else {
+        None
+    }
+}
+
+/// 判断是否为「下游拒绝 `advisor_tool_result` 未知块」类的客户端校验错误（400/422）。
+///
+/// 本地降级默认回注 `advisor_tool_result`；第三方 executor 对未知块 type 校验严格时报
+/// 400（原型 #7 实测 k3 如此），据此触发回退普通 `tool_result`（ADR-0002 题 4）。
+fn is_advisor_block_rejection(error: &ProxyError) -> bool {
+    matches!(error, ProxyError::UpstreamError { status, .. } if *status == 400 || *status == 422)
+}
+
+/// advisor 回路中最近一次注入的 `advisor_tool_result` 回注快照。
+///
+/// 仅当本轮回注为 `advisor_tool_result` 形状时记录，供下游拒绝该未知块（400/422）时
+/// 回退重发普通 `tool_result`：截断到 `base_len`、用同一份内容以 `tool_result` 重建。
+struct PendingInjection {
+    /// 追加回注前 `messages` 的长度（回退时截断至此）。
+    base_len: usize,
+    /// 含 advisor `tool_use` 的 assistant 消息 content。
+    assistant_content: Value,
+    /// 被回注的 `tool_use.id`（回链用）。
+    tool_use_id: String,
+    /// 建议明文。
+    advice: String,
 }
 
 fn rewrite_codex_responses_endpoint_to_chat(endpoint: &str) -> (String, Option<String>) {
