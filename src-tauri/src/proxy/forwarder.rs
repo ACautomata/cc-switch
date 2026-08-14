@@ -268,6 +268,28 @@ impl RequestForwarder {
         }
     }
 
+    /// 客户端请求维度：把已记的成功改记为失败（review #27 F15）。
+    ///
+    /// 背景：`forward_with_retry` 一拿到上游 2xx 就在共享 status 记
+    /// `success_requests += 1`；advisor 回路（隔离 status 的 forwarder）在主
+    /// forward 成功**之后**失败时，入站请求实际以错误收场，客户端可见结果与
+    /// 共享计数背离（失败被计成功、success_rate 虚高）。此方法把该入站请求的
+    /// 账目重分类为失败：成功饱和减一、失败加一、记录 last_error、重算成功率。
+    /// 仅动客户端请求维度——熔断器/路由记录不动（首个上游响应确实成功过）。
+    ///
+    /// 注：「forward 成功后处理失败不修正」在非 advisor 路径（process_response /
+    /// handle_claude_transform 失败）同样存在，属既有行为，不在本方法 scope。
+    pub async fn reclassify_success_as_failure(&self, error: &ProxyError) {
+        let mut status = self.status.write().await;
+        status.success_requests = status.success_requests.saturating_sub(1);
+        status.failed_requests += 1;
+        status.last_error = Some(error.to_string());
+        if status.total_requests > 0 {
+            status.success_rate =
+                (status.success_requests as f32 / status.total_requests as f32) * 100.0;
+        }
+    }
+
     async fn record_success_result(
         &self,
         provider_id: &str,
@@ -3690,8 +3712,11 @@ mod tests {
         // 客户端请求维度的 status：正常 forward 会把 total_requests +1。
         // （空 providers 立即返回 Err、不发网络，但 wrapper 已在入口 +1。）
         let status = Arc::new(RwLock::new(ProxyStatus::default()));
-        let forwarder =
-            test_forwarder_with_status(status.clone(), Duration::from_secs(1), Duration::from_secs(1));
+        let forwarder = test_forwarder_with_status(
+            status.clone(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
 
         let _ = forwarder
             .forward_with_retry(
@@ -3704,7 +3729,11 @@ mod tests {
                 vec![],
             )
             .await;
-        assert_eq!(status.read().await.total_requests, 1, "正常路径应记一次客户端请求");
+        assert_eq!(
+            status.read().await.total_requests,
+            1,
+            "正常路径应记一次客户端请求"
+        );
 
         // 内部回路（advisor 子调用/续跑）用隔离 status 的 forwarder：
         // 不应把同一入站请求衍生的内部调用计入客户端请求指标（review #27）。
@@ -3725,6 +3754,63 @@ mod tests {
             1,
             "隔离 status 的内部调用不得触碰客户端请求计数"
         );
+    }
+
+    /// F15（codex review #27）：主 forward 成功（2xx 已记 success）后 advisor
+    /// 回路失败 → 客户端拿到错误。共享 status 必须把该入站请求改记为失败，
+    /// 否则失败请求被计成功、success_rate 虚高。
+    #[tokio::test]
+    async fn reclassify_success_as_failure_flips_client_accounting() {
+        let status = Arc::new(RwLock::new(ProxyStatus::default()));
+        // 模拟主 forward 成功后的账目：total=1 / success=1 / rate=100
+        {
+            let mut s = status.write().await;
+            s.total_requests = 1;
+            s.success_requests = 1;
+            s.success_rate = 100.0;
+        }
+        let forwarder = test_forwarder_with_status(
+            status.clone(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+
+        // advisor 回路失败的错误（ResponseBodyTooLarge 是回路真实错误出口之一）
+        forwarder
+            .reclassify_success_as_failure(&ProxyError::ResponseBodyTooLarge(
+                MAX_RESPONSE_BODY_BYTES,
+            ))
+            .await;
+
+        let s = status.read().await;
+        assert_eq!(s.total_requests, 1, "total 不变（仍是同一次入站请求）");
+        assert_eq!(s.success_requests, 0, "已记的成功必须撤销");
+        assert_eq!(s.failed_requests, 1, "该入站请求改记失败");
+        assert_eq!(s.success_rate, 0.0, "成功率按新账目重算");
+        assert!(s.last_error.is_some(), "失败原因落到 last_error");
+    }
+
+    /// F15 边界：success 为 0（异常路径）时不得下溢。
+    #[tokio::test]
+    async fn reclassify_success_as_failure_saturates_at_zero() {
+        let status = Arc::new(RwLock::new(ProxyStatus::default()));
+        {
+            let mut s = status.write().await;
+            s.total_requests = 1;
+        }
+        let forwarder = test_forwarder_with_status(
+            status.clone(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+
+        forwarder
+            .reclassify_success_as_failure(&ProxyError::Timeout("advisor 续跑超时".into()))
+            .await;
+
+        let s = status.read().await;
+        assert_eq!(s.success_requests, 0, "饱和减一、不下溢");
+        assert_eq!(s.failed_requests, 1);
     }
 
     #[test]

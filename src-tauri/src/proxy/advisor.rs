@@ -31,22 +31,51 @@ use crate::proxy::{
 };
 use serde_json::{json, Value};
 
-/// text 块的 UTF-8 字节直和（`text` 字段长度；非 text 块不计）。
-///
-/// 是合并进响应体的增量下界（真实合并体 ≥ 此值），按它判超限是保守方向
-/// （review #28 C3：回路累积多帧前文本时限制聚合字节，防各帧各自 ≤ 上限
-/// 但合计无界地驻留内存）。
-pub fn text_blocks_byte_len(blocks: &[Value]) -> usize {
-    blocks
-        .iter()
-        .filter_map(|b| b.get("text").and_then(Value::as_str))
-        .map(str::len)
-        .sum()
-}
-
 /// 已累积字节加上新帧字节是否超过响应体上限（review #28 C3）。
 pub fn exceeds_response_limit(accumulated: usize, incoming: usize, limit: usize) -> bool {
     accumulated.saturating_add(incoming) > limit
+}
+
+/// 块的序列化字节数（同步纯函数，review #27 F14）。
+///
+/// 按 serde_json 实际转义**精确**计量每块的序列化长度，外加每块 +1 字节
+/// （并入最终 content 数组时的分隔逗号，保守方向）。原文 `str::len` 直和会低估
+/// 真实增量：控制字符转义 1→6 字节（`\u0001`）、引号/反斜杠 1→2、每块另有
+/// ~25 字节 `{"type":"text","text":…}` 包装——两个「各自未超限」的帧可以合并出
+/// 越过上限的序列化体。超过 `budget` 返回 `None`：计数 writer 超限即中断，
+/// 不为度量物化整份序列化副本（那正是上限要防的分配）。
+pub fn serialized_blocks_bytes(blocks: &[Value], budget: usize) -> Option<usize> {
+    let mut counter = BoundedCounter { written: 0, budget };
+    for block in blocks {
+        if serde_json::to_writer(&mut counter, block).is_err() {
+            return None;
+        }
+        // 并入 content 数组时的分隔逗号（保守：首块前实际可能无逗号）
+        counter.written += 1;
+        if counter.written > budget {
+            return None;
+        }
+    }
+    Some(counter.written)
+}
+
+/// 只计数、不落盘的 writer：写出超过预算即报错，序列化随之中断。
+struct BoundedCounter {
+    written: usize,
+    budget: usize,
+}
+
+impl std::io::Write for BoundedCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.written += buf.len();
+        if self.written > self.budget {
+            return Err(std::io::Error::other("serialized bytes exceed budget"));
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Claude Code 客户端发来的 advisor 服务器工具块 type。
@@ -318,10 +347,7 @@ pub fn resolve_advisor_model(
 /// 一致处理（与 executor 同一条映射管线：命中已配档则映射、未命中且无 default 则
 /// 原样透传给端点）。否则客户端明确指定的具体模型会被档位未配误判丢弃、改跑
 /// executor（常更弱）的模型。
-fn advisor_tier_is_configured(
-    tier: &str,
-    mapping: &super::model_mapper::ModelMapping,
-) -> bool {
+fn advisor_tier_is_configured(tier: &str, mapping: &super::model_mapper::ModelMapping) -> bool {
     let lower = tier.to_lowercase();
     // 具体 Anthropic 模型 ID：放行，由 model_mapper 与 executor 一致地处理。
     if lower.starts_with("claude-") {
@@ -346,18 +372,15 @@ fn advisor_tier_is_configured(
 /// 多值头剥单值、留其余（按逗号分段过滤）；剥完为空则移除整个头。找不到
 /// 该值时 headers 原样不动。上游因残留 beta 头报错时由调用方在发送前调用。
 pub fn strip_advisor_beta_header(headers: &mut http::HeaderMap) {
-    let has_advisor = headers
-        .get_all("anthropic-beta")
-        .iter()
-        .any(|value| {
-            value
-                .to_str()
-                .map(|s| {
-                    s.split(',')
-                        .any(|part| part.trim() == ADVISOR_BETA_HEADER_VALUE)
-                })
-                .unwrap_or(false)
-        });
+    let has_advisor = headers.get_all("anthropic-beta").iter().any(|value| {
+        value
+            .to_str()
+            .map(|s| {
+                s.split(',')
+                    .any(|part| part.trim() == ADVISOR_BETA_HEADER_VALUE)
+            })
+            .unwrap_or(false)
+    });
     if !has_advisor {
         return;
     }
@@ -615,7 +638,8 @@ impl AdvisorForwarder for RequestForwarder {
         extensions: http::Extensions,
         provider: &Provider,
         is_advisor_subcall: bool,
-    ) -> impl std::future::Future<Output = Result<(ProxyResponse, String, String), ProxyError>> + Send {
+    ) -> impl std::future::Future<Output = Result<(ProxyResponse, String, String), ProxyError>> + Send
+    {
         let label = if is_advisor_subcall {
             "advisor 子调用"
         } else {
@@ -703,21 +727,16 @@ pub async fn run_advisor_subcall<F: AdvisorForwarder>(
         } else {
             std::time::Duration::ZERO
         };
-    let (_, _status, body_bytes) = super::response_processor::read_decoded_body(
-        response,
-        "Advisor",
-        body_timeout,
-    )
-    .await?;
+    let (_, _status, body_bytes) =
+        super::response_processor::read_decoded_body(response, "Advisor", body_timeout).await?;
 
-    let response_json: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
-        ProxyError::TransformError(format!("advisor 子调用响应解析失败: {e}"))
-    })?;
+    let response_json: Value = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ProxyError::TransformError(format!("advisor 子调用响应解析失败: {e}")))?;
 
     // 提取文本建议（丢弃 thinking 等非 text 块）
-    extract_advisor_text(&response_json).map(Value::String).ok_or_else(|| {
-        ProxyError::TransformError("advisor 子调用响应无 text 块".to_string())
-    })
+    extract_advisor_text(&response_json)
+        .map(Value::String)
+        .ok_or_else(|| ProxyError::TransformError("advisor 子调用响应无 text 块".to_string()))
 }
 
 /// 回路执行结果
@@ -766,7 +785,8 @@ pub async fn run_advisor_loop<F: AdvisorForwarder>(
     // 只回最后一帧会丢失它（review #27 F08）。回路结束时合并进最终响应。
     let mut pre_advisor_text: Vec<Value> = Vec::new();
     // 累积字节计数（review #28 C3）：各帧各自过 bytes_with_limit，但累积本身
-    // 需限制聚合字节，防多帧近上限响应合计无界驻留内存。
+    // 需限制聚合字节，防多帧近上限响应合计无界驻留内存。按**序列化字节数**
+    // 计量（review #27 F14）——原文直和会低估转义膨胀与块包装，漏报越限。
     let mut pre_advisor_bytes: usize = 0;
     let mut iterations = 0usize;
 
@@ -788,14 +808,13 @@ pub async fn run_advisor_loop<F: AdvisorForwarder>(
                 std::time::Duration::ZERO
             };
         let (mut response_headers, status, body_bytes) =
-            super::response_processor::read_decoded_body(response, ctx.tag, body_timeout)
-                .await?;
+            super::response_processor::read_decoded_body(response, ctx.tag, body_timeout).await?;
 
         if !status.is_success() {
             // 上游错误：透传（错误响应体原样返回客户端）
-            let body_json = serde_json::from_slice(&body_bytes).unwrap_or_else(|_| {
-                json!({"error": {"message": String::from_utf8_lossy(&body_bytes).to_string()}})
-            });
+            let body_json = serde_json::from_slice(&body_bytes).unwrap_or_else(
+                |_| json!({"error": {"message": String::from_utf8_lossy(&body_bytes).to_string()}}),
+            );
             return Ok(AdvisorLoopOutcome::Completed {
                 headers: response_headers,
                 status,
@@ -828,7 +847,8 @@ pub async fn run_advisor_loop<F: AdvisorForwarder>(
             } else {
                 // 合并前：累积 + 最终帧字节的合计上限（review #28 C3）——各帧各自
                 // ≤ MAX 但累积 + 最终帧仍可能近 2×MAX，合并体与序列化副本会成倍
-                // 放大驻留内存。
+                // 放大驻留内存。累积侧已是序列化字节数（含每块分隔符，review #27
+                // F14），最终帧侧 body_bytes 即其序列化长度。
                 if exceeds_response_limit(
                     pre_advisor_bytes,
                     body_bytes.len(),
@@ -855,12 +875,15 @@ pub async fn run_advisor_loop<F: AdvisorForwarder>(
 
         // 本帧含 advisor tool_use、即将被消费：累积其 executor 文本（advisor 调用前
         // 的部分），回路结束时合并进最终响应（review #27 F08）。累积字节超限即失败
-        // （review #28 C3）——与单帧超限（bytes_with_limit）同语义。
+        // ——与单帧超限（bytes_with_limit）同语义；计量按序列化字节数、预算为
+        // 上限减已累积（review #27 F14：原文 str::len 直和低估转义膨胀与块包装，
+        // 两帧「各自未超限」可合并出越过上限的序列化体）。
         let frame_text = extract_text_blocks(&response_json);
-        let frame_bytes = text_blocks_byte_len(&frame_text);
-        if exceeds_response_limit(pre_advisor_bytes, frame_bytes, MAX_RESPONSE_BODY_BYTES) {
-            return Err(ProxyError::ResponseBodyTooLarge(MAX_RESPONSE_BODY_BYTES));
-        }
+        let frame_bytes = serialized_blocks_bytes(
+            &frame_text,
+            MAX_RESPONSE_BODY_BYTES.saturating_sub(pre_advisor_bytes),
+        )
+        .ok_or(ProxyError::ResponseBodyTooLarge(MAX_RESPONSE_BODY_BYTES))?;
         pre_advisor_bytes += frame_bytes;
         pre_advisor_text.extend(frame_text);
 
@@ -914,11 +937,8 @@ pub async fn run_advisor_loop<F: AdvisorForwarder>(
         // 续跑（钉死同一 provider）。`forward` 把一切非 2xx 转成 `Err(UpstreamError)`
         // （forwarder.rs 错误单一出口），故 400 只能在 `Err` 里识别、不会以 `Ok` 响应
         // 的 status 出现——改用 `continuation_needs_tool_result_fallback` 判定。
-        let continued_body = build_continuation_request(
-            &current_body,
-            &assistant_message,
-            &injection_message,
-        );
+        let continued_body =
+            build_continuation_request(&current_body, &assistant_message, &injection_message);
         match forwarder
             .forward_once(
                 &ctx.app_type,
@@ -974,25 +994,21 @@ pub async fn run_advisor_loop<F: AdvisorForwarder>(
     }
 
     // 达到迭代上限：读最后一次响应
-    let (headers_out, status, body_bytes) = super::response_processor::read_decoded_body(
-        response,
-        ctx.tag,
-        std::time::Duration::ZERO,
-    )
-    .await?;
+    let (headers_out, status, body_bytes) =
+        super::response_processor::read_decoded_body(response, ctx.tag, std::time::Duration::ZERO)
+            .await?;
     if !status.is_success() {
-        let body_json = serde_json::from_slice(&body_bytes).unwrap_or_else(|_| {
-            json!({"error": {"message": String::from_utf8_lossy(&body_bytes).to_string()}})
-        });
+        let body_json = serde_json::from_slice(&body_bytes).unwrap_or_else(
+            |_| json!({"error": {"message": String::from_utf8_lossy(&body_bytes).to_string()}}),
+        );
         return Ok(AdvisorLoopOutcome::Completed {
             headers: headers_out,
             status,
             body: body_json,
         });
     }
-    let response_json = serde_json::from_slice(&body_bytes).map_err(|e| {
-        ProxyError::TransformError(format!("executor 响应解析失败: {e}"))
-    })?;
+    let response_json = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ProxyError::TransformError(format!("executor 响应解析失败: {e}")))?;
     Ok(AdvisorLoopOutcome::Completed {
         headers: headers_out,
         status,
@@ -1082,9 +1098,18 @@ mod tests {
         assert_eq!(rewrite.capture.max_uses, Some(3));
 
         let tools = rewrite.body.get("tools").and_then(Value::as_array).unwrap();
-        assert_eq!(tools.len(), 2, "server tool replaced by client tool, custom kept");
-        assert!(tools.iter().all(|t| t.get("type").and_then(Value::as_str) != Some("advisor_20260301")));
-        let advisor_tool = tools.iter().find(|t| t.get("name").and_then(Value::as_str) == Some("advisor")).unwrap();
+        assert_eq!(
+            tools.len(),
+            2,
+            "server tool replaced by client tool, custom kept"
+        );
+        assert!(tools
+            .iter()
+            .all(|t| t.get("type").and_then(Value::as_str) != Some("advisor_20260301")));
+        let advisor_tool = tools
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some("advisor"))
+            .unwrap();
         // 对齐 wire contract（docs/research/issue-5-advisor-client-shape.md:216-223）：
         // Anthropic 自定义工具仅 name/description/input_schema，**不带** OpenAI 包装
         // 形状的 `type: "function"` 字段——严格网关会因该未知字段拒绝请求（review #27）。
@@ -1093,7 +1118,10 @@ mod tests {
             "Anthropic 自定义工具不应携带 type 字段，实际: {:?}",
             advisor_tool.get("type")
         );
-        assert!(advisor_tool.get("description").and_then(Value::as_str).is_some());
+        assert!(advisor_tool
+            .get("description")
+            .and_then(Value::as_str)
+            .is_some());
         assert_eq!(
             advisor_tool.pointer("/input_schema/properties"),
             Some(&json!({}))
@@ -1168,11 +1196,20 @@ mod tests {
             max_uses: None,
             max_tokens: Some(2000),
         };
-        let req = build_advisor_request(&executor, "claude-opus-4-8", None, vec![json!({"role": "user", "content": "hi"})]);
+        let req = build_advisor_request(
+            &executor,
+            "claude-opus-4-8",
+            None,
+            vec![json!({"role": "user", "content": "hi"})],
+        );
         assert_eq!(req["model"], "claude-opus-4-8");
         // max_tokens 沿用 executor 值（ADR-0001：不取 capture 的 max_tokens）
         assert_eq!(req["max_tokens"], 1000);
-        assert_eq!(req["tools"], json!([]), "empty tools — protocol-level read-only");
+        assert_eq!(
+            req["tools"],
+            json!([]),
+            "empty tools — protocol-level read-only"
+        );
         assert_eq!(req["messages"], json!([{"role": "user", "content": "hi"}]));
         assert_eq!(req["system"][0]["text"], ORACLE_SYSTEM_PROMPT);
     }
@@ -1241,7 +1278,10 @@ mod tests {
         let messages = continued["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[2]["content"][0]["type"], "tool_result");
-        assert_eq!(continued["tools"], body["tools"], "tools preserved for re-call");
+        assert_eq!(
+            continued["tools"], body["tools"],
+            "tools preserved for re-call"
+        );
         assert_eq!(continued["model"], "m");
     }
 
@@ -1256,13 +1296,19 @@ mod tests {
                 {"type": "text", "text": "line two"}
             ]
         });
-        assert_eq!(extract_advisor_text(&response).as_deref(), Some("line one\nline two"));
+        assert_eq!(
+            extract_advisor_text(&response).as_deref(),
+            Some("line one\nline two")
+        );
     }
 
     #[test]
     fn empty_or_missing_text_returns_none() {
         assert_eq!(extract_advisor_text(&json!({"content": []})), None);
-        assert_eq!(extract_advisor_text(&json!({"content": [{"type": "thinking"}]})), None);
+        assert_eq!(
+            extract_advisor_text(&json!({"content": [{"type": "thinking"}]})),
+            None
+        );
         assert_eq!(extract_advisor_text(&json!({})), None);
     }
 
@@ -1277,10 +1323,7 @@ mod tests {
             {"type": "text", "text": "more text"}
         ]});
         let blocks = extract_text_blocks(&resp);
-        let texts: Vec<&str> = blocks
-            .iter()
-            .map(|b| b["text"].as_str().unwrap())
-            .collect();
+        let texts: Vec<&str> = blocks.iter().map(|b| b["text"].as_str().unwrap()).collect();
         assert_eq!(texts, vec!["pre-advisor reasoning", "more text"]);
     }
 
@@ -1292,9 +1335,7 @@ mod tests {
 
     #[test]
     fn merge_pre_advisor_text_prepends_and_preserves_final() {
-        let accumulated = vec![
-            json!({"type": "text", "text": "pre-advisor reasoning"}),
-        ];
+        let accumulated = vec![json!({"type": "text", "text": "pre-advisor reasoning"})];
         let final_body = json!({
             "content": [{"type": "text", "text": "final answer"}],
             "stop_reason": "end_turn",
@@ -1352,23 +1393,42 @@ mod tests {
             "content": [{"type": "tool_use", "id": "toolu_01", "name": "advisor", "input": {}}]
         });
         assert!(should_continue_with_advisor(&response));
-        assert!(!should_continue_with_advisor(&json!({"content": [{"type": "text", "text": "done"}]})));
+        assert!(!should_continue_with_advisor(
+            &json!({"content": [{"type": "text", "text": "done"}]})
+        ));
     }
 
     #[test]
     fn continuation_fallback_only_on_http_400() {
         // 下游 400（advisor_tool_result 未知块）→ 回退普通 tool_result
-        assert!(continuation_needs_tool_result_fallback(&ProxyError::UpstreamError {
-            status: 400,
-            body: None,
-        }));
+        assert!(continuation_needs_tool_result_fallback(
+            &ProxyError::UpstreamError {
+                status: 400,
+                body: None,
+            }
+        ));
         // 其余 4xx / 5xx / 网络错误不重试，直接透传
         for err in [
-            ProxyError::UpstreamError { status: 401, body: None },
-            ProxyError::UpstreamError { status: 404, body: None },
-            ProxyError::UpstreamError { status: 429, body: None },
-            ProxyError::UpstreamError { status: 500, body: None },
-            ProxyError::UpstreamError { status: 529, body: None },
+            ProxyError::UpstreamError {
+                status: 401,
+                body: None,
+            },
+            ProxyError::UpstreamError {
+                status: 404,
+                body: None,
+            },
+            ProxyError::UpstreamError {
+                status: 429,
+                body: None,
+            },
+            ProxyError::UpstreamError {
+                status: 500,
+                body: None,
+            },
+            ProxyError::UpstreamError {
+                status: 529,
+                body: None,
+            },
             ProxyError::Timeout("t".to_string()),
             ProxyError::ForwardFailed("f".to_string()),
         ] {
@@ -1382,7 +1442,8 @@ mod tests {
     // ── base_url 读取 ──
 
     #[test]
-    fn reads_base_url_from_provider_env() {        let provider = Provider::with_id(
+    fn reads_base_url_from_provider_env() {
+        let provider = Provider::with_id(
             "p".into(),
             "P".into(),
             json!({"env": {"ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic/"}}),
@@ -1510,15 +1571,24 @@ mod tests {
     #[test]
     fn strips_advisor_beta_value_keeping_others() {
         let mut headers = http::HeaderMap::new();
-        headers.insert("anthropic-beta", http::HeaderValue::from_static("claude-code-20250219,advisor-tool-2026-03-01"));
+        headers.insert(
+            "anthropic-beta",
+            http::HeaderValue::from_static("claude-code-20250219,advisor-tool-2026-03-01"),
+        );
         strip_advisor_beta_header(&mut headers);
-        assert_eq!(headers.get("anthropic-beta").unwrap().to_str().unwrap(), "claude-code-20250219");
+        assert_eq!(
+            headers.get("anthropic-beta").unwrap().to_str().unwrap(),
+            "claude-code-20250219"
+        );
     }
 
     #[test]
     fn strips_advisor_beta_value_removing_header_when_only_value() {
         let mut headers = http::HeaderMap::new();
-        headers.insert("anthropic-beta", http::HeaderValue::from_static("advisor-tool-2026-03-01"));
+        headers.insert(
+            "anthropic-beta",
+            http::HeaderValue::from_static("advisor-tool-2026-03-01"),
+        );
         strip_advisor_beta_header(&mut headers);
         assert!(headers.get("anthropic-beta").is_none());
     }
@@ -1526,7 +1596,10 @@ mod tests {
     #[test]
     fn leaves_headers_unchanged_without_advisor_beta() {
         let mut headers = http::HeaderMap::new();
-        headers.insert("anthropic-beta", http::HeaderValue::from_static("claude-code-20250219"));
+        headers.insert(
+            "anthropic-beta",
+            http::HeaderValue::from_static("claude-code-20250219"),
+        );
         headers.insert("x-test", http::HeaderValue::from_static("v"));
         let original = headers.clone();
         strip_advisor_beta_header(&mut headers);
@@ -1536,10 +1609,20 @@ mod tests {
     #[test]
     fn strips_advisor_beta_from_multi_value_header() {
         let mut headers = http::HeaderMap::new();
-        headers.append("anthropic-beta", http::HeaderValue::from_static("advisor-tool-2026-03-01"));
-        headers.append("anthropic-beta", http::HeaderValue::from_static("claude-code-20250219"));
+        headers.append(
+            "anthropic-beta",
+            http::HeaderValue::from_static("advisor-tool-2026-03-01"),
+        );
+        headers.append(
+            "anthropic-beta",
+            http::HeaderValue::from_static("claude-code-20250219"),
+        );
         strip_advisor_beta_header(&mut headers);
-        let values: Vec<&str> = headers.get_all("anthropic-beta").iter().filter_map(|v| v.to_str().ok()).collect();
+        let values: Vec<&str> = headers
+            .get_all("anthropic-beta")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
         assert_eq!(values, vec!["claude-code-20250219"]);
     }
 
@@ -1622,8 +1705,11 @@ mod tests {
             json!({"env":{"ANTHROPIC_BASE_URL":"https://k3.example.com"}}),
             None,
         );
-        let ctx =
-            crate::proxy::handler_context::RequestContext::for_test(provider, "claude-sonnet-4-5", AppType::Claude);
+        let ctx = crate::proxy::handler_context::RequestContext::for_test(
+            provider,
+            "claude-sonnet-4-5",
+            AppType::Claude,
+        );
 
         // 续跑帧：仅最终文本、无 advisor tool_use → 回路在此终止
         let forwarder = ScriptedForwarder {
@@ -1671,8 +1757,18 @@ mod tests {
             AdvisorLoopOutcome::NoAdvisorCall { response } => response,
             AdvisorLoopOutcome::Completed { body, .. } => {
                 // 兜底：若走 Completed，body 已是 Value
-                let texts: Vec<&str> = body["content"].as_array().unwrap().iter()
-                    .filter_map(|b| if b["type"] == "text" { b["text"].as_str() } else { None }).collect();
+                let texts: Vec<&str> = body["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|b| {
+                        if b["type"] == "text" {
+                            b["text"].as_str()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 assert_eq!(texts, vec!["pre-advisor reasoning", "final answer"]);
                 return;
             }
@@ -1685,8 +1781,18 @@ mod tests {
         .await
         .unwrap();
         let v: Value = serde_json::from_slice(&body_bytes).unwrap();
-        let texts: Vec<&str> = v["content"].as_array().unwrap().iter()
-            .filter_map(|b| if b["type"] == "text" { b["text"].as_str() } else { None }).collect();
+        let texts: Vec<&str> = v["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| {
+                if b["type"] == "text" {
+                    b["text"].as_str()
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(texts, vec!["pre-advisor reasoning", "final answer"]);
     }
 
@@ -1704,8 +1810,11 @@ mod tests {
             json!({"env":{"ANTHROPIC_BASE_URL":"https://k3.example.com"}}),
             None,
         );
-        let ctx =
-            crate::proxy::handler_context::RequestContext::for_test(provider, "claude-sonnet-4-5", AppType::Claude);
+        let ctx = crate::proxy::handler_context::RequestContext::for_test(
+            provider,
+            "claude-sonnet-4-5",
+            AppType::Claude,
+        );
 
         // 续跑帧（最终帧）：上游带 content-length = 该帧自身的序列化长度
         let final_frame = json!({
@@ -1757,7 +1866,9 @@ mod tests {
 
         let response = match outcome {
             AdvisorLoopOutcome::NoAdvisorCall { response } => response,
-            AdvisorLoopOutcome::Completed { .. } => panic!("终止帧无 advisor 调用，应为 NoAdvisorCall"),
+            AdvisorLoopOutcome::Completed { .. } => {
+                panic!("终止帧无 advisor 调用，应为 NoAdvisorCall")
+            }
         };
 
         // 先取头快照（read_decoded_body 按值消费 response）
@@ -1776,15 +1887,27 @@ mod tests {
             "合并后 body 应大于最终帧原长度"
         );
         let v: Value = serde_json::from_slice(&body_bytes).unwrap();
-        let texts: Vec<&str> = v["content"].as_array().unwrap().iter()
-            .filter_map(|b| if b["type"] == "text" { b["text"].as_str() } else { None }).collect();
+        let texts: Vec<&str> = v["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| {
+                if b["type"] == "text" {
+                    b["text"].as_str()
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(texts, vec!["pre-advisor reasoning", "final answer"]);
 
         // 断言（红）：重建 body 的实体头必须剥掉——残留的 content-length 描述的是
         // 旧 body，handle_non_streaming 会原样转发它（只剥 hop-by-hop），客户端
         // 按 content-length 截断收到不完整 JSON。
         assert!(
-            out_headers.get(axum::http::header::CONTENT_LENGTH).is_none(),
+            out_headers
+                .get(axum::http::header::CONTENT_LENGTH)
+                .is_none(),
             "合并重建 body 后不得残留过期 content-length，实际: {:?}",
             out_headers.get(axum::http::header::CONTENT_LENGTH)
         );
@@ -1837,8 +1960,12 @@ mod tests {
             ]
         });
         let merged = merge_pre_advisor_text(final_body, &accumulated);
-        let types: Vec<&str> = merged["content"].as_array().unwrap().iter()
-            .map(|b| b["type"].as_str().unwrap()).collect();
+        let types: Vec<&str> = merged["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["type"].as_str().unwrap())
+            .collect();
         assert_eq!(types, vec!["redacted_thinking", "text", "text"]);
     }
 
@@ -1848,21 +1975,13 @@ mod tests {
         let accumulated = vec![json!({"type": "text", "text": "pre"})];
         let final_body = json!({"content": [{"type": "text", "text": "final"}]});
         let merged = merge_pre_advisor_text(final_body, &accumulated);
-        let texts: Vec<&str> = merged["content"].as_array().unwrap().iter()
-            .map(|b| b["text"].as_str().unwrap()).collect();
+        let texts: Vec<&str> = merged["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["text"].as_str().unwrap())
+            .collect();
         assert_eq!(texts, vec!["pre", "final"]);
-    }
-
-    /// C3（codex review #28）：text 块字节数（UTF-8 text 字段直和，非 text 块不计）。
-    #[test]
-    fn text_blocks_byte_len_sums_utf8_text_bytes() {
-        let blocks = vec![
-            json!({"type": "text", "text": "hello"}), // 5 字节
-            json!({"type": "text", "text": "你好"}),   // 6 字节（UTF-8 每汉字 3 字节）
-            json!({"type": "thinking", "thinking": "不计入"}), // 非 text 块不计
-        ];
-        assert_eq!(text_blocks_byte_len(&blocks), 11);
-        assert_eq!(text_blocks_byte_len(&[]), 0);
     }
 
     /// C3（codex review #28）：累积 + 新帧字节超过响应体上限 → 超限。
@@ -1878,5 +1997,47 @@ mod tests {
         assert!(exceeds_response_limit(LIMIT + 1, 0, LIMIT));
         // usize 溢出安全（saturating）
         assert!(exceeds_response_limit(usize::MAX, 1, LIMIT));
+    }
+
+    /// F14（codex review #27）：计量必须按序列化字节数、不能按原文 `str::len`
+    /// 直和——控制字符原文 1 字节、serde_json 转义为 6 字节。raw 直和 20 ≤
+    /// budget 100，但序列化 25（包装）+ 20×6 + 1（分隔）= 146 > 100 → 必须判超限。
+    #[test]
+    fn serialized_blocks_bytes_counts_escaping_not_raw_len() {
+        let blocks = vec![json!({"type": "text", "text": "\u{1}".repeat(20)})];
+        assert_eq!(serialized_blocks_bytes(&blocks, 100), None);
+    }
+
+    /// F14：每块计量 = `serde_json::to_vec(块)` + 1 分隔字节；空集为 0。
+    #[test]
+    fn serialized_blocks_bytes_exact_is_to_vec_plus_separator_per_block() {
+        let blocks = vec![
+            json!({"type": "text", "text": "plain"}),
+            json!({"type": "text", "text": "你好\n"}),
+        ];
+        let expected: usize = blocks
+            .iter()
+            .map(|b| serde_json::to_vec(b).unwrap().len() + 1)
+            .sum();
+        assert_eq!(serialized_blocks_bytes(&blocks, expected), Some(expected));
+        assert_eq!(serialized_blocks_bytes(&[], 0), Some(0));
+    }
+
+    /// F14：每块 ~25 字节的包装开销必须计入——1 字节文本 ×3 块 raw 直和仅 3 字节，
+    /// 真实序列化增量 3×27 = 81 字节。
+    #[test]
+    fn serialized_blocks_bytes_counts_wrapper_overhead() {
+        let blocks = vec![
+            json!({"type": "text", "text": "a"}),
+            json!({"type": "text", "text": "b"}),
+            json!({"type": "text", "text": "c"}),
+        ];
+        assert_eq!(serialized_blocks_bytes(&blocks, 30), None);
+        // 预算充足时给出精确值
+        let exact: usize = blocks
+            .iter()
+            .map(|b| serde_json::to_vec(b).unwrap().len() + 1)
+            .sum();
+        assert_eq!(serialized_blocks_bytes(&blocks, exact), Some(exact));
     }
 }
