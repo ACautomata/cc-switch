@@ -29,7 +29,7 @@
 
 - **cc-switch 不注入任何「何时调用 advisor」的引导**。本工具仅在 **Claude Code 客户端**场景使用；客户端已把「何时调用」注入到它自己的 system prompt，并把 advisor 工具放进 `tools[]`。executor 自行判断何时发 `tool_use`。
 - **cc-switch 是被动的**：在请求定稿段剥离 `advisor_20260301` server-tool 块 → 替换为普通客户端工具 `advisor`（无参数）→ 捕获 executor 发来的 `tool_use` → 本地 advisor 推理 → 回注。不 nudge、不改写 executor 的 system。
-- **节流靠透传**：`max_uses` 原样透传客户端给定的值；客户端未设则 cc-switch 不加自己的上限。
+- **节流靠透传**：`max_uses` 原样透传客户端给定的值；客户端未设则 cc-switch 不加自己的上限。官方端点透传时由服务端强制该上限；本地降级回路由 cc-switch 代为执行——达到上限后不再发起 advisor 子调用、回注普通 `tool_result` 明文（与失败降级同形状），**不本地复刻 `max_uses_exceeded` 结构化错误块**（spec Out of Scope 排除的是错误块复刻，非上限执行）。
 
 ### 防重入
 

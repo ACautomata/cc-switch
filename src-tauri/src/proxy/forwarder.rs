@@ -2489,6 +2489,23 @@ impl RequestForwarder {
         // 2. 按值剥 advisor beta 头（本地用明文块变体，不依赖该头）。
         let stripped_headers = super::advisor::strip_advisor_beta_from_headers(headers);
 
+        // 3. 进回路前应用一次 `body.messages` 覆盖（codex P2）：advisor 请求与普通请求
+        //    应看到同一份被覆盖的消息，否则同 provider 下行为分叉（普通请求见替换后
+        //    messages、advisor 请求见原始 messages）。回路内 forward_inner 以
+        //    skip_message_overrides=true 跳过重复应用（整组替换会吞掉回注）。
+        //    只应用 messages 键——其余键（如 model）在 forward_inner 内部模型映射
+        //    **之后**应用，提前应用会改变映射输入。copilot 走转换层，advisor 门控
+        //    （needs_transform）已排除，无需 is_copilot 门。
+        if let Some(override_messages) = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.local_proxy_request_overrides.as_ref())
+            .and_then(|overrides| overrides.body.as_ref())
+            .and_then(|body| body.get("messages"))
+        {
+            loop_body["messages"] = override_messages.clone();
+        }
+
         let mapping = super::model_mapper::ModelMapping::from_provider(provider);
         let executor_max_tokens = loop_body
             .get("max_tokens")
@@ -2500,9 +2517,13 @@ impl RequestForwarder {
         // 用于 advisor_tool_result → tool_result 回退）；tool_result 回注无回退对象，置 None。
         let mut pending: Option<PendingInjection> = None;
         let mut executor_mapped_model: Option<String> = None;
+        // 已发起的 advisor 调用数（并行多 id 逐个计），执行客户端 max_uses 上限。
+        let mut advisor_uses: u64 = 0;
 
-        // 循环直到 executor 不再调 advisor（US-34：本地不自造上限）。转录每轮增长，
-        // executor 上下文溢出时其 forward 报错、回路随之终止，无真死循环。
+        // 循环直到 executor 不再调 advisor。终止保险三道：客户端 max_uses 上限
+        // （can_use_advisor，达到后不再发子调用）；转录每轮增长，executor 上下文溢出时
+        // 其 forward 报错、回路随之终止；executor 自行停止调用（常态）。客户端未设
+        // 上限时无第一道（US-34：cc-switch 不自造上限）。
         loop {
             // advisor 回路内调用：模型照常映射（false），messages 覆盖须跳过（true）——
             // body.messages 整组替换会吞掉回注（codex P1）。
@@ -2586,9 +2607,13 @@ impl RequestForwarder {
                 return Ok((response, claude_api_format, outbound_model));
             }
 
-            // 捕获到 advisor 调用（可能并行多个）→ 起本地子调用取建议（None = 子调用失败）。
-            let outcome = self
-                .run_advisor_subcall(
+            // 捕获到 advisor 调用（可能并行多个）→ 起本地子调用取建议。达到客户端
+            // max_uses 上限后不再发起子调用，回注明文让 executor 继续（codex P1；
+            // 官方端点由服务端强制上限，本地降级由回路代为执行，不本地复刻
+            // max_uses_exceeded 错误块）。并行多 id 逐个计数（同轮共享一次子调用）。
+            let outcome = if super::advisor::can_use_advisor(advisor_uses, capture.max_uses) {
+                advisor_uses += calls.ids.len() as u64;
+                self.run_advisor_subcall(
                     app_type,
                     method,
                     provider,
@@ -2603,30 +2628,49 @@ impl RequestForwarder {
                     executor_mapped_model.as_deref(),
                     executor_max_tokens,
                 )
-                .await;
+                .await
+            } else {
+                log::info!(
+                    "[Advisor] advisor 调用次数已达客户端上限 max_uses={}，跳过子调用",
+                    capture.max_uses.unwrap_or_default()
+                );
+                Some(super::advisor::Advice {
+                    text: super::advisor::limit_reached_advice(
+                        capture.max_uses.unwrap_or_default(),
+                    ),
+                    stop_reason: None,
+                })
+            };
 
             // 构造回注（assistant 含 tool_use 的消息 + 下一条 user 消息）并 append 进 messages。
             // 三分支（US-26 / 数据契约）：成功 → advisor_tool_result（下游拒绝过则回退
-            // tool_result）；子调用失败 → 一律普通 tool_result 明文「advisor 不可用」。
+            // tool_result，stop_reason 透传进 advisor_result 变体）；子调用失败 → 一律普通
+            // tool_result 明文「advisor 不可用」。
             let assistant_content = resp_json.get("content").cloned().unwrap_or(Value::Null);
-            let (advice, shape) = match outcome {
-                Some(text) => {
+            let (advice, stop_reason, shape) = match outcome {
+                Some(a) => {
                     let shape = if use_tool_result_fallback {
                         super::advisor::InjectShape::ToolResult
                     } else {
                         super::advisor::InjectShape::AdvisorToolResult
                     };
-                    (text, shape)
+                    (a.text, a.stop_reason, shape)
                 }
                 None => (
                     super::advisor::unavailable_advice(),
+                    None,
                     super::advisor::InjectShape::ToolResult,
                 ),
             };
             // 并行多调用逐个回链（每个 advisor tool_use 都得有配对结果）；同轮同转录，
             // 各调用共享同一份建议。
-            let continuation =
-                super::advisor::build_continuation(&assistant_content, &calls.ids, &advice, shape);
+            let continuation = super::advisor::build_continuation(
+                &assistant_content,
+                &calls.ids,
+                &advice,
+                stop_reason.as_deref(),
+                shape,
+            );
             let base_len = loop_body
                 .get("messages")
                 .and_then(Value::as_array)
@@ -2634,6 +2678,12 @@ impl RequestForwarder {
                 .unwrap_or(0);
             if let Some(arr) = loop_body.get_mut("messages").and_then(Value::as_array_mut) {
                 arr.extend(continuation);
+            }
+            // 回注后剥除强制 tool_choice（codex P1）：tool_choice 是单请求参数，官方
+            // 语义一次请求只强制一次；原样保留会让每轮续跑都被迫再调 advisor → 重复
+            // 付费循环直到上下文溢出。强制调用已发生并已回注，续跑轮恢复自由选择。
+            if super::advisor::strip_forced_tool_choice(&mut loop_body) {
+                log::debug!("[Advisor] 已剥除续跑轮的强制 tool_choice");
             }
             // 仅 advisor_tool_result 形状才可能被下游拒绝 → 记录 pending 以备回退。
             pending = match shape {
@@ -2649,12 +2699,14 @@ impl RequestForwarder {
         }
     }
 
-    /// 起一次 advisor 子调用，返回建议文本（`None` = 子调用失败或取不到有效建议）。
+    /// 起一次 advisor 子调用，返回建议（文本 + 终止原因；`None` = 子调用失败或取不到
+    /// 有效建议）。
     ///
     /// Oracle 系统提示 + 完整转录 + 空 `tools`、`max_tokens` 沿用 executor、模型经
     /// `model_mapper` 分档映射（未配该档回落 executor 已映射模型）。复用 forwarder
     /// （熔断/用量记录）但跳过模型二次映射（模型已解析）。`None` 由调用方以普通
     /// `tool_result` 明文「不可用」回注（最小安全网，不 5xx；六码归因属切片 2）。
+    /// 子调用撞 `max_tokens` 天花板时按官方形状追加截断标记（codex P2）。
     #[allow(clippy::too_many_arguments)]
     async fn run_advisor_subcall(
         &self,
@@ -2671,7 +2723,7 @@ impl RequestForwarder {
         mapping: &super::model_mapper::ModelMapping,
         executor_mapped_model: Option<&str>,
         executor_max_tokens: u64,
-    ) -> Option<String> {
+    ) -> Option<super::advisor::Advice> {
         let executor_model = executor_mapped_model
             .map(str::to_string)
             .or_else(|| {
@@ -2735,7 +2787,10 @@ impl RequestForwarder {
                 .await
                 .ok()
                 .and_then(|resp| buffered_json(&resp))
-                .and_then(|j| super::advisor::extract_advice_text(&j)),
+                // 建议被 max_tokens 截断时追加官方标记，executor 才能区分完整建议与
+                // 半句截断（codex P2）。
+                .and_then(|j| super::advisor::extract_advice(&j))
+                .map(|advice| super::advisor::annotate_truncation(advice, executor_max_tokens)),
             Err(e) => {
                 log::warn!("[Advisor] 子调用失败，回注「不可用」让 executor 继续: {e}");
                 None
@@ -3335,10 +3390,12 @@ struct PendingInjection {
 fn rebuild_continuation_as_tool_result(loop_body: &mut Value, pending: &PendingInjection) {
     if let Some(arr) = loop_body.get_mut("messages").and_then(Value::as_array_mut) {
         arr.truncate(pending.base_len);
+        // tool_result 明文形状无 stop_reason 字段；截断标记（如有）已嵌在 advice 文本里。
         arr.extend(super::advisor::build_continuation(
             &pending.assistant_content,
             &pending.tool_use_ids,
             &pending.advice,
+            None,
             super::advisor::InjectShape::ToolResult,
         ));
     }

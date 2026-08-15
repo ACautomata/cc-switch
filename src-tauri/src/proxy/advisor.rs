@@ -151,12 +151,15 @@ You are advising a working (executor) model, not the end user. The executor's fu
 
 /// 从 advisor 服务器工具块捕获的参数。
 ///
-/// 数据契约中入站块含 `model`/`max_uses`/`max_tokens`/`caching` 四字段；切片 1 只消费
-/// `model`（advisor 档位解析）。`max_uses`/`max_tokens` 本地语义为透传/不取用（US-34/US-15），
-/// `caching` 随切片 4 缓存注入再捕获——故此处只捕获 `model`。
+/// 数据契约中入站块含 `model`/`max_uses`/`max_tokens`/`caching` 四字段；切片 1 消费
+/// `model`（advisor 档位解析）与 `max_uses`（客户端用量上限，回路执行，见
+/// `can_use_advisor`）。`max_tokens` 本地语义为透传/不取用（US-15，子调用沿用
+/// executor 值），`caching` 随切片 4 缓存注入再捕获——故此处只捕获这两个。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AdvisorCapture {
     pub model: Option<String>,
+    /// 客户端给定的 advisor 用量上限（`None` = 未设、不加自造上限，US-34）。
+    pub max_uses: Option<u64>,
 }
 
 /// 识别到的 advisor 调用集合（executor 发出的普通 `tool_use`，name == "advisor"）。
@@ -238,6 +241,7 @@ pub fn rewrite_request(body: &mut Value) -> Option<AdvisorCapture> {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(String::from),
+        max_uses: block.get("max_uses").and_then(Value::as_u64),
     };
 
     // 在原位置注入普通客户端工具 advisor（无参），保持 tools 顺序稳定。
@@ -349,14 +353,48 @@ pub fn join_text_blocks(content: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// 从子调用响应提取建议文本（`None` 表示取不到有效建议）。
-pub fn extract_advice_text(response: &Value) -> Option<String> {
+/// advisor 子调用的建议结果：文本 + 终止原因。
+///
+/// `stop_reason` 透传子调用响应顶层值（官方 `advisor_result` 契约：设了工具 `max_tokens`
+/// 时携带，见 `docs/research/issue-5-advisor-client-shape.md`）。`"max_tokens"` 表示建议
+/// 被截断，由 [`annotate_truncation`] 追加官方标记后回注，executor 才能区分完整建议与
+/// 半句截断。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Advice {
+    pub text: String,
+    pub stop_reason: Option<String>,
+}
+
+/// 从子调用响应提取建议（`None` 表示取不到有效建议）。
+pub fn extract_advice(response: &Value) -> Option<Advice> {
     let text = join_text_blocks(response.get("content")?);
     if text.trim().is_empty() {
-        None
-    } else {
-        Some(text)
+        return None;
     }
+    Some(Advice {
+        text,
+        stop_reason: response
+            .get("stop_reason")
+            .and_then(Value::as_str)
+            .map(String::from),
+    })
+}
+
+/// 子调用撞 `max_tokens` 天花板时，按官方形状在建议文本尾部追加截断标记。
+///
+/// 官方语义（issue-5 研究文档）：截断的 `advisor_result` 带追加标记
+/// `[Advisor output truncated at max_tokens=N.]` + `stop_reason:"max_tokens"`；不标记则
+/// 半句截断被当完整建议回注，executor 无法区分（codex P2）。其余终止原因原样返回。
+pub fn annotate_truncation(mut advice: Advice, max_tokens: u64) -> Advice {
+    if advice.stop_reason.as_deref() == Some("max_tokens") {
+        advice.text = format!("{}\n\n{}", advice.text, truncation_marker(max_tokens));
+    }
+    advice
+}
+
+/// 官方截断标记明文。
+fn truncation_marker(max_tokens: u64) -> String {
+    format!("[Advisor output truncated at max_tokens={max_tokens}.]")
 }
 
 /// 构造 advisor 子调用的「完整对话转录」quoted context。
@@ -398,9 +436,11 @@ pub fn build_subcall_body(model: &str, max_tokens: u64, transcript: &Value) -> V
 
 /// 构造回注：含 advisor `tool_use` 的 assistant 消息 + 下一条 user 消息（结果块）。
 ///
-/// 忠实官方：`advisor_tool_result{content: advisor_result{text}}` 放 user 消息（本地是
-/// 客户端工具，`tool_use`/`tool_result` 惯例要求结果在下一条 user 消息）；下游不认
-/// `advisor_tool_result` 时回退普通 `tool_result`（content 直接放建议明文）。
+/// 忠实官方：`advisor_tool_result{content: advisor_result{text, stop_reason?}}` 放 user
+/// 消息（本地是客户端工具，`tool_use`/`tool_result` 惯例要求结果在下一条 user 消息）；
+/// 下游不认 `advisor_tool_result` 时回退普通 `tool_result`（content 直接放建议明文，
+/// 截断标记已嵌在文本里）。`stop_reason` 仅 `advisor_result` 变体携带（`None` 时省略，
+/// 对齐官方「设了 max_tokens 才有该字段」）；`tool_result` 明文形状无此字段。
 ///
 /// 并行多个 advisor 调用时 `tool_use_ids` 逐个回链（每个 `tool_use` 都得有配对结果，
 /// 否则严格端点报「未配对 tool_use」400）；同轮同转录，故各调用共享同一份建议。
@@ -408,17 +448,27 @@ pub fn build_continuation(
     assistant_content: &Value,
     tool_use_ids: &[String],
     advice: &str,
+    stop_reason: Option<&str>,
     shape: InjectShape,
 ) -> Vec<Value> {
     let assistant_msg = serde_json::json!({ "role": "assistant", "content": assistant_content });
     let results: Vec<Value> = tool_use_ids
         .iter()
         .map(|id| match shape {
-            InjectShape::AdvisorToolResult => serde_json::json!({
-                "type": "advisor_tool_result",
-                "tool_use_id": id,
-                "content": { "type": "advisor_result", "text": advice }
-            }),
+            InjectShape::AdvisorToolResult => {
+                let mut content = serde_json::json!({
+                    "type": "advisor_result",
+                    "text": advice
+                });
+                if let Some(reason) = stop_reason {
+                    content["stop_reason"] = serde_json::Value::String(reason.to_string());
+                }
+                serde_json::json!({
+                    "type": "advisor_tool_result",
+                    "tool_use_id": id,
+                    "content": content
+                })
+            }
             InjectShape::ToolResult => serde_json::json!({
                 "type": "tool_result",
                 "tool_use_id": id,
@@ -466,6 +516,45 @@ pub fn is_error_envelope(value: &Value) -> bool {
 /// 继续，绝不整请求 5xx。六码归因 + 「原因」用词属切片 2，这里只给通用明文。
 pub fn unavailable_advice() -> String {
     "advisor 本地推理暂不可用，本次无建议。请基于现有信息继续。".to_string()
+}
+
+/// 是否还允许再发起 advisor 子调用（客户端 `max_uses` 上限执行，codex P1）。
+///
+/// 官方端点由服务端强制 `max_uses`；本地降级要忠实该行为就由回路代为执行：达到上限后
+/// 不再发起子调用、回注明文（见 [`limit_reached_advice`]）——**不本地复刻
+/// `max_uses_exceeded` 结构化错误块**（spec Out of Scope 排除的是错误块，非上限执行）。
+/// `cap == None`（客户端未设）恒 `true`：cc-switch 不加自造上限（US-34）。
+pub fn can_use_advisor(used: u64, cap: Option<u64>) -> bool {
+    cap.is_none_or(|cap| used < cap)
+}
+
+/// 达到客户端 `max_uses` 上限后的回注明文（普通 `tool_result`，与失败降级同形状）。
+pub fn limit_reached_advice(cap: u64) -> String {
+    format!(
+        "advisor 调用次数已达客户端设定的上限（max_uses={cap}），本次无建议。请基于现有信息继续。"
+    )
+}
+
+/// 剥除顶层强制 `tool_choice`（`{type:"tool"}` / `{type:"any"}`；`auto` 与缺省不动）。
+///
+/// `tool_choice` 是单请求参数，官方语义一次请求只强制一次。advisor 回路把它原样保留
+/// 会让**每轮续跑**都被迫再调 advisor（指名 advisor 时必然、`any` 且 advisor 是唯一
+/// 工具时同样），重复付费循环直到上下文溢出（codex P1）。强制调用已发生并已回注，
+/// 续跑轮恢复自由选择。返回是否剥除（仅用于日志）。
+pub fn strip_forced_tool_choice(body: &mut Value) -> bool {
+    let forced = body
+        .get("tool_choice")
+        .and_then(|tc| tc.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|t| t == "tool" || t == "any");
+    if forced {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("tool_choice");
+        }
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -529,6 +618,7 @@ mod tests {
         let capture = rewrite_request(&mut body).expect("应捕获 advisor 参数");
 
         assert_eq!(capture.model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(capture.max_uses, Some(3));
 
         let tools = body["tools"].as_array().unwrap();
         // server 块被剥，总数不变（1 个 server 块换成 1 个 client 块）
@@ -553,6 +643,16 @@ mod tests {
         let before = body.clone();
         assert!(rewrite_request(&mut body).is_none());
         assert_eq!(body, before);
+    }
+
+    #[test]
+    fn rewrite_captures_max_uses_only_when_present() {
+        // 客户端未设 max_uses → None（回路不加自造上限，US-34）。
+        let mut body = json!({
+            "tools": [{ "type": "advisor_20260301", "name": "advisor", "model": "m" }]
+        });
+        let capture = rewrite_request(&mut body).expect("应捕获");
+        assert_eq!(capture.max_uses, None);
     }
 
     #[test]
@@ -710,11 +810,56 @@ mod tests {
     }
 
     #[test]
-    fn extract_advice_text_some_and_none() {
-        let ok = json!({ "content": [{ "type": "text", "text": "建议" }] });
-        assert_eq!(extract_advice_text(&ok).as_deref(), Some("建议"));
+    fn extract_advice_some_and_none() {
+        let ok = json!({
+            "content": [{ "type": "text", "text": "建议" }],
+            "stop_reason": "end_turn"
+        });
+        assert_eq!(
+            extract_advice(&ok),
+            Some(Advice {
+                text: "建议".into(),
+                stop_reason: Some("end_turn".into())
+            })
+        );
         let only_thinking = json!({ "content": [{ "type": "thinking", "thinking": "x" }] });
-        assert!(extract_advice_text(&only_thinking).is_none());
+        assert_eq!(extract_advice(&only_thinking), None);
+        // 无 stop_reason 字段（端点省略）→ None
+        let no_reason = json!({ "content": [{ "type": "text", "text": "建议" }] });
+        assert_eq!(
+            extract_advice(&no_reason),
+            Some(Advice {
+                text: "建议".into(),
+                stop_reason: None
+            })
+        );
+    }
+
+    #[test]
+    fn annotate_truncation_marks_max_tokens_stop() {
+        // 撞 max_tokens 天花板：追加官方截断标记（codex P2），stop_reason 原样保留。
+        let advice = Advice {
+            text: "Use a channel-based pattern. The tricky part of".into(),
+            stop_reason: Some("max_tokens".into()),
+        };
+        let annotated = annotate_truncation(advice, 2048);
+        assert_eq!(
+            annotated.text,
+            "Use a channel-based pattern. The tricky part of\n\n[Advisor output truncated at max_tokens=2048.]"
+        );
+        assert_eq!(annotated.stop_reason.as_deref(), Some("max_tokens"));
+    }
+
+    #[test]
+    fn annotate_truncation_leaves_normal_advice_untouched() {
+        for reason in [Some("end_turn"), None] {
+            let advice = Advice {
+                text: "完整建议".into(),
+                stop_reason: reason.map(str::to_string),
+            };
+            let annotated = annotate_truncation(advice, 2048);
+            assert_eq!(annotated.text, "完整建议");
+        }
     }
 
     // ---------- 回注体构造 ----------
@@ -727,6 +872,7 @@ mod tests {
             &content,
             &["toolu_abc".to_string()],
             "用 channel 协调",
+            None,
             InjectShape::AdvisorToolResult,
         );
         assert_eq!(msgs.len(), 2);
@@ -744,6 +890,28 @@ mod tests {
     }
 
     #[test]
+    fn continuation_advisor_tool_result_carries_stop_reason() {
+        // 官方契约：设了 max_tokens 时 advisor_result 携带 stop_reason（codex P2）。
+        let content =
+            json!([{ "type": "tool_use", "id": "toolu_abc", "name": "advisor", "input": {} }]);
+        let msgs = build_continuation(
+            &content,
+            &["toolu_abc".to_string()],
+            "半句建议\n\n[Advisor output truncated at max_tokens=2048.]",
+            Some("max_tokens"),
+            InjectShape::AdvisorToolResult,
+        );
+        assert_eq!(
+            msgs[1]["content"][0]["content"],
+            json!({
+                "type": "advisor_result",
+                "text": "半句建议\n\n[Advisor output truncated at max_tokens=2048.]",
+                "stop_reason": "max_tokens"
+            })
+        );
+    }
+
+    #[test]
     fn continuation_tool_result_fallback_shape() {
         let content =
             json!([{ "type": "tool_use", "id": "toolu_abc", "name": "advisor", "input": {} }]);
@@ -751,8 +919,10 @@ mod tests {
             &content,
             &["toolu_abc".to_string()],
             "建议明文",
+            Some("end_turn"),
             InjectShape::ToolResult,
         );
+        // 回退明文形状无 stop_reason 字段；截断标记（如有）已嵌在文本里。
         assert_eq!(
             msgs[1]["content"][0],
             json!({ "type": "tool_result", "tool_use_id": "toolu_abc", "content": "建议明文" })
@@ -770,6 +940,7 @@ mod tests {
             &content,
             &["toolu_a".to_string(), "toolu_b".to_string()],
             "建议",
+            None,
             InjectShape::ToolResult,
         );
         assert_eq!(msgs.len(), 2);
@@ -906,5 +1077,54 @@ mod tests {
             &json!({ "content": [{ "type": "tool_use", "id": "t", "name": "advisor" }] })
         ));
         assert!(!is_error_envelope(&json!({})));
+    }
+
+    // ---------- max_uses 上限执行（codex P1） ----------
+
+    #[test]
+    fn can_use_advisor_respects_client_cap_and_unlimited() {
+        // 未设上限：恒可用（cc-switch 不自造上限，US-34）
+        assert!(can_use_advisor(0, None));
+        assert!(can_use_advisor(999, None));
+        // 设了 max_uses=1：首次可用、之后不可用
+        assert!(can_use_advisor(0, Some(1)));
+        assert!(!can_use_advisor(1, Some(1)));
+        assert!(!can_use_advisor(2, Some(1)));
+    }
+
+    #[test]
+    fn limit_reached_advice_mentions_cap() {
+        let text = limit_reached_advice(3);
+        assert!(text.contains("max_uses=3"));
+        assert!(text.contains("无建议"));
+    }
+
+    // ---------- 强制 tool_choice 剥离（codex P1） ----------
+
+    #[test]
+    fn strip_forced_tool_choice_removes_tool_and_any() {
+        // 指名 advisor 的强制选择：每轮续跑会被迫再调 advisor → 付费循环，须剥除
+        let mut body = json!({
+            "model": "m",
+            "tool_choice": { "type": "tool", "name": "advisor" },
+            "messages": []
+        });
+        assert!(strip_forced_tool_choice(&mut body));
+        assert!(body.get("tool_choice").is_none());
+
+        // any（advisor 为唯一工具时同样构成强制）
+        let mut body = json!({ "tool_choice": { "type": "any" } });
+        assert!(strip_forced_tool_choice(&mut body));
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn strip_forced_tool_choice_keeps_auto_and_absent() {
+        let mut body = json!({ "tool_choice": { "type": "auto" } });
+        assert!(!strip_forced_tool_choice(&mut body));
+        assert_eq!(body["tool_choice"]["type"], "auto");
+
+        let mut body = json!({ "model": "m" });
+        assert!(!strip_forced_tool_choice(&mut body));
     }
 }
