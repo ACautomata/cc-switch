@@ -2421,7 +2421,11 @@ impl RequestForwarder {
         if !matches!(app_type, AppType::Claude) {
             return false;
         }
-        if !is_claude_messages_path(endpoint) {
+        // 端点可能带 query（handlers 用 path_and_query 传入）。先剥 query 再对纯 path 精确
+        // 匹配（对齐 rewrite_claude_transform_endpoint 的先例），否则带 query 时误判为非
+        // /v1/messages → 降级静默关闭、未剥离的 advisor 块 + beta 头直发上游。
+        let (path, _) = split_endpoint_and_query(endpoint);
+        if !is_claude_messages_path(path) {
             return false;
         }
         if is_streaming_request(endpoint, body, headers) {
@@ -2518,7 +2522,7 @@ impl RequestForwarder {
                                 arr.truncate(p.base_len);
                                 arr.extend(super::advisor::build_continuation(
                                     &p.assistant_content,
-                                    &p.tool_use_id,
+                                    &p.tool_use_ids,
                                     &p.advice,
                                     super::advisor::InjectShape::ToolResult,
                                 ));
@@ -2544,11 +2548,20 @@ impl RequestForwarder {
                 return Ok((response, claude_api_format, outbound_model));
             };
             // 无 advisor 调用 → 终态，把最终响应返给客户端（对客户端透明）。
-            let Some(call) = super::advisor::find_advisor_call(&resp_json) else {
+            let Some(calls) = super::advisor::find_advisor_calls(&resp_json) else {
                 return Ok((response, claude_api_format, outbound_model));
             };
+            // 混合轮：advisor 与其它客户端工具同轮并行。代理只能答 advisor、无法代执行外部
+            // 工具，强行内部续跑会留下未配对 tool_use（严格端点 400）。回退终态、原样返给
+            // 客户端（稀有并行调用的可接受降级；代价是注入的 advisor 客户端工具暴露给 Claude Code）。
+            if calls.has_external_tool_use {
+                log::warn!(
+                    "[Advisor] advisor 与其它客户端工具同轮并行，无法透明续跑，回退终态返回"
+                );
+                return Ok((response, claude_api_format, outbound_model));
+            }
 
-            // 捕获到 advisor 调用 → 起本地子调用取建议（None = 子调用失败）。
+            // 捕获到 advisor 调用（可能并行多个）→ 起本地子调用取建议（None = 子调用失败）。
             let outcome = self
                 .run_advisor_subcall(
                     app_type,
@@ -2585,8 +2598,10 @@ impl RequestForwarder {
                     super::advisor::InjectShape::ToolResult,
                 ),
             };
+            // 并行多调用逐个回链（每个 advisor tool_use 都得有配对结果）；同轮同转录，
+            // 各调用共享同一份建议。
             let continuation =
-                super::advisor::build_continuation(&assistant_content, &call.id, &advice, shape);
+                super::advisor::build_continuation(&assistant_content, &calls.ids, &advice, shape);
             let base_len = loop_body
                 .get("messages")
                 .and_then(Value::as_array)
@@ -2600,7 +2615,7 @@ impl RequestForwarder {
                 super::advisor::InjectShape::AdvisorToolResult => Some(PendingInjection {
                     base_len,
                     assistant_content,
-                    tool_use_id: call.id,
+                    tool_use_ids: calls.ids.clone(),
                     advice,
                 }),
                 super::advisor::InjectShape::ToolResult => None,
@@ -2653,7 +2668,12 @@ impl RequestForwarder {
             .cloned()
             .unwrap_or(Value::Null);
         let current_text = super::advisor::join_text_blocks(&content);
-        let mut conversation = loop_body
+        // 转录引用前剥 `_` 前缀私有字段：loop_body 未经过 prepare_upstream_request_body
+        //（过滤发生在 forward_inner 内部的出站路径），直接引用会把私有字段（如
+        // _session_token）泄进 advisor 转录；一旦序列进转录字符串，子调用出站过滤就再也
+        // 看不到这些键。与 executor 出站口径一致地先过滤（只需私有字段剥离，无需 canonicalize）。
+        let filtered_body = filter_private_params_with_whitelist(loop_body.clone(), &[]);
+        let mut conversation = filtered_body
             .get("messages")
             .cloned()
             .unwrap_or_else(|| serde_json::json!([]));
@@ -2661,8 +2681,8 @@ impl RequestForwarder {
             arr.push(serde_json::json!({ "role": "assistant", "content": content }));
         }
         let transcript = super::advisor::build_transcript(
-            loop_body.get("system"),
-            loop_body.get("tools"),
+            filtered_body.get("system"),
+            filtered_body.get("tools"),
             &conversation,
             &current_text,
         );
@@ -3220,12 +3240,23 @@ fn is_claude_messages_path(path: &str) -> bool {
 const DEFAULT_ADVISOR_MAX_TOKENS: u64 = 8192;
 
 /// 读取非流式（Buffered）响应体并解析为 JSON；非 Buffered 或解析失败返回 None。
+///
+/// 上游可能对非流式透传响应压缩（`Content-Encoding: gzip/br/zstd`）；reqwest 未启用
+/// 自动解压，`Buffered` 里是原始字节。直接 `from_slice` 会把压缩体误判为「非 JSON」，让
+/// advisor 回路把 executor 的 advisor 调用当终态静默返回（codex P1）。故按 `Content-Encoding`
+/// 解压后再解析；不支持的编码 / 解压失败则退回原始字节（多半解析失败 → None，与原行为一致）。
 fn buffered_json(response: &ProxyResponse) -> Option<Value> {
-    if let ProxyResponse::Buffered { body, .. } = response {
-        serde_json::from_slice(body).ok()
-    } else {
-        None
-    }
+    let ProxyResponse::Buffered { body, headers, .. } = response else {
+        return None;
+    };
+    let raw: &[u8] = body.as_ref();
+    let decompressed = get_content_encoding(headers).and_then(|enc| {
+        decompress_body_with_limit(&enc, raw, MAX_RESPONSE_BODY_BYTES)
+            .ok()
+            .flatten()
+    });
+    let bytes: &[u8] = decompressed.as_deref().unwrap_or(raw);
+    serde_json::from_slice(bytes).ok()
 }
 
 /// 判断是否为「下游拒绝 `advisor_tool_result` 未知块」类的客户端校验错误（400/422）。
@@ -3245,8 +3276,8 @@ struct PendingInjection {
     base_len: usize,
     /// 含 advisor `tool_use` 的 assistant 消息 content。
     assistant_content: Value,
-    /// 被回注的 `tool_use.id`（回链用）。
-    tool_use_id: String,
+    /// 被回注的 advisor `tool_use.id`（可能并行多个），回链用。
+    tool_use_ids: Vec<String>,
     /// 建议明文。
     advice: String,
 }
@@ -4164,6 +4195,36 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&prepared).unwrap(),
             r#"{"a":2,"tools":[{"name":"lookup","parameters":{"properties":{"_id":{"type":"string"},"a":{"type":"string"},"b":{"type":"number"}},"type":"object"}}],"z":1}"#
+        );
+    }
+
+    #[test]
+    fn buffered_json_parses_plain_body() {
+        let resp = ProxyResponse::buffered(
+            StatusCode::OK,
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"content":[]}"#),
+        );
+        assert_eq!(buffered_json(&resp), Some(json!({"content": []})));
+    }
+
+    #[test]
+    fn buffered_json_decompresses_gzip_before_parse() {
+        // 上游对非流式透传响应 gzip 压缩：reqwest 不自动解压，须按 Content-Encoding 解压
+        // 后再解析，否则压缩体被误判为「非 JSON」→ advisor 回路静默失效（codex P1）。
+        let payload = br#"{"content":[{"type":"tool_use","name":"advisor","id":"toolu_1"}]}"#;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", HeaderValue::from_static("gzip"));
+        let resp = ProxyResponse::buffered(StatusCode::OK, headers, Bytes::from(compressed));
+
+        // 压缩体直接 from_slice 必然失败；解压后应能解析出 advisor tool_use。
+        assert_eq!(
+            buffered_json(&resp),
+            Some(json!({"content": [{"type": "tool_use", "name": "advisor", "id": "toolu_1"}]}))
         );
     }
 
