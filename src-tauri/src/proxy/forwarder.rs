@@ -1160,7 +1160,16 @@ impl RequestForwarder {
         adapter: &dyn ProviderAdapter,
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
         self.forward_inner(
-            app_type, method, provider, endpoint, body, headers, extensions, adapter, false, false,
+            app_type,
+            method,
+            provider,
+            endpoint,
+            body,
+            headers,
+            extensions,
+            adapter,
+            false,
+            LoopOverridePolicy::ApplyAll,
         )
         .await
     }
@@ -1171,10 +1180,10 @@ impl RequestForwarder {
     /// `apply_model_mapping`，避免对最终模型名二次映射（预解析值不含档位关键词时，
     /// 二次映射会错落到 default）。其余定稿（[1m] 剥离、thinking 归一等）照常。
     ///
-    /// `skip_message_overrides` 用于 advisor 回路内的调用：`localProxyRequestOverrides`
-    /// 的 `body.messages` 是整组替换，会吞掉回路追加的回注、让 executor 每轮看到相同
-    /// 请求（无限付费循环，codex P1）——回路内 messages 由回路管理，该键跳过、其余
-    /// 覆盖照常生效。
+    /// `override_policy` 控制 `localProxyRequestOverrides.body` 覆盖的应用范围（见
+    /// [`LoopOverridePolicy`]）：普通请求全应用；advisor 回路内 executor 调用跳过
+    /// `messages` 键（整组替换会吞掉回注）；advisor 子调用跳过全部（Oracle 提示与
+    /// 空 tools 是协议要求，不得被 executor 覆盖顶掉）。
     #[allow(clippy::too_many_arguments)]
     async fn forward_inner(
         &self,
@@ -1187,7 +1196,7 @@ impl RequestForwarder {
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
         skip_model_mapping: bool,
-        skip_message_overrides: bool,
+        override_policy: LoopOverridePolicy,
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
         // 使用适配器提取 base_url
         let mut base_url = adapter.extract_base_url(provider)?;
@@ -1654,11 +1663,8 @@ impl RequestForwarder {
                 .as_ref()
                 .and_then(|meta| meta.local_proxy_request_overrides.as_ref())
             {
-                if apply_local_proxy_body_overrides(
-                    &mut filtered_body,
-                    overrides,
-                    skip_message_overrides,
-                ) {
+                if apply_local_proxy_body_overrides(&mut filtered_body, overrides, override_policy)
+                {
                     filtered_body = prepare_upstream_request_body(filtered_body);
                 }
             }
@@ -2492,7 +2498,7 @@ impl RequestForwarder {
         // 3. 进回路前应用一次 `body.messages` 覆盖（codex P2）：advisor 请求与普通请求
         //    应看到同一份被覆盖的消息，否则同 provider 下行为分叉（普通请求见替换后
         //    messages、advisor 请求见原始 messages）。回路内 forward_inner 以
-        //    skip_message_overrides=true 跳过重复应用（整组替换会吞掉回注）。
+        //    SkipMessages 跳过重复应用（整组替换会吞掉回注）。
         //    只应用 messages 键——其余键（如 model）在 forward_inner 内部模型映射
         //    **之后**应用，提前应用会改变映射输入。copilot 走转换层，advisor 门控
         //    （needs_transform）已排除，无需 is_copilot 门。
@@ -2525,8 +2531,8 @@ impl RequestForwarder {
         // 其 forward 报错、回路随之终止；executor 自行停止调用（常态）。客户端未设
         // 上限时无第一道（US-34：cc-switch 不自造上限）。
         loop {
-            // advisor 回路内调用：模型照常映射（false），messages 覆盖须跳过（true）——
-            // body.messages 整组替换会吞掉回注（codex P1）。
+            // advisor 回路内调用：模型照常映射（false），messages 覆盖须跳过
+            // （SkipMessages）——body.messages 整组替换会吞掉回注（codex P1）。
             let attempt = self
                 .forward_inner(
                     app_type,
@@ -2538,7 +2544,7 @@ impl RequestForwarder {
                     extensions,
                     adapter,
                     false,
-                    true,
+                    LoopOverridePolicy::SkipMessages,
                 )
                 .await;
             let (response, claude_api_format, outbound_model) = match attempt {
@@ -2611,57 +2617,60 @@ impl RequestForwarder {
             // max_uses 上限后不再发起子调用，回注明文让 executor 继续（codex P1；
             // 官方端点由服务端强制上限，本地降级由回路代为执行，不本地复刻
             // max_uses_exceeded 错误块）。并行多 id 逐个计数（同轮共享一次子调用）。
-            let outcome = if super::advisor::can_use_advisor(advisor_uses, capture.max_uses) {
-                advisor_uses += calls.ids.len() as u64;
-                self.run_advisor_subcall(
-                    app_type,
-                    method,
-                    provider,
-                    endpoint,
-                    &stripped_headers,
-                    extensions,
-                    adapter,
-                    &loop_body,
-                    &resp_json,
-                    &capture,
-                    &mapping,
-                    executor_mapped_model.as_deref(),
-                    executor_max_tokens,
-                )
-                .await
-            } else {
-                log::info!(
-                    "[Advisor] advisor 调用次数已达客户端上限 max_uses={}，跳过子调用",
-                    capture.max_uses.unwrap_or_default()
-                );
-                Some(super::advisor::Advice {
-                    text: super::advisor::limit_reached_advice(
-                        capture.max_uses.unwrap_or_default(),
-                    ),
-                    stop_reason: None,
-                })
-            };
-
+            //
+            // 回注形状三分支（US-26 / 数据契约 + codex P2）：子调用成功 →
+            // advisor_tool_result（下游拒绝过则回退 tool_result，stop_reason 透传进
+            // advisor_result 变体）；子调用失败与上限耗尽 → 一律普通 tool_result 明文
+            // （CONTEXT.md 契约：与失败降级同形状；上限明文走成功形状会被宽容 executor
+            // 当真建议收下、严格网关多付一轮拒绝重试）。
             // 构造回注（assistant 含 tool_use 的消息 + 下一条 user 消息）并 append 进 messages。
-            // 三分支（US-26 / 数据契约）：成功 → advisor_tool_result（下游拒绝过则回退
-            // tool_result，stop_reason 透传进 advisor_result 变体）；子调用失败 → 一律普通
-            // tool_result 明文「advisor 不可用」。
             let assistant_content = resp_json.get("content").cloned().unwrap_or(Value::Null);
-            let (advice, stop_reason, shape) = match outcome {
-                Some(a) => {
-                    let shape = if use_tool_result_fallback {
-                        super::advisor::InjectShape::ToolResult
-                    } else {
-                        super::advisor::InjectShape::AdvisorToolResult
-                    };
-                    (a.text, a.stop_reason, shape)
-                }
-                None => (
-                    super::advisor::unavailable_advice(),
-                    None,
-                    super::advisor::InjectShape::ToolResult,
-                ),
-            };
+            let (advice, stop_reason, shape) =
+                if super::advisor::can_use_advisor(advisor_uses, capture.max_uses) {
+                    advisor_uses += calls.ids.len() as u64;
+                    match self
+                        .run_advisor_subcall(
+                            app_type,
+                            method,
+                            provider,
+                            endpoint,
+                            &stripped_headers,
+                            extensions,
+                            adapter,
+                            &loop_body,
+                            &resp_json,
+                            &capture,
+                            &mapping,
+                            executor_mapped_model.as_deref(),
+                            executor_max_tokens,
+                        )
+                        .await
+                    {
+                        Some(a) => {
+                            let shape = if use_tool_result_fallback {
+                                super::advisor::InjectShape::ToolResult
+                            } else {
+                                super::advisor::InjectShape::AdvisorToolResult
+                            };
+                            (a.text, a.stop_reason, shape)
+                        }
+                        None => (
+                            super::advisor::unavailable_advice(),
+                            None,
+                            super::advisor::InjectShape::ToolResult,
+                        ),
+                    }
+                } else {
+                    log::info!(
+                        "[Advisor] advisor 调用次数已达客户端上限 max_uses={}，跳过子调用",
+                        capture.max_uses.unwrap_or_default()
+                    );
+                    (
+                        super::advisor::limit_reached_advice(capture.max_uses.unwrap_or_default()),
+                        None,
+                        super::advisor::InjectShape::ToolResult,
+                    )
+                };
             // 并行多调用逐个回链（每个 advisor tool_use 都得有配对结果）；同轮同转录，
             // 各调用共享同一份建议。
             let continuation = super::advisor::build_continuation(
@@ -2766,8 +2775,11 @@ impl RequestForwarder {
         let subcall_body =
             super::advisor::build_subcall_body(&advisor_model, executor_max_tokens, &transcript);
 
-        // 复用 forwarder 路径，跳过模型二次映射（模型已预解析）；messages 覆盖同样
-        // 跳过——子调用转录在 messages 里，被整组替换会让 advisor 收到错误的上下文。
+        // 复用 forwarder 路径，跳过模型二次映射（模型已预解析）；body 覆盖整体跳过
+        // （SkipAll）——子调用的 Oracle system 与空 tools 是协议要求，被 executor 的
+        // system/tools 覆盖顶掉会让 advisor 以错误提示跑、甚至输出 tool_use 而非建议
+        // （codex P2）；转录在 messages 里，messages 整组替换同样会让 advisor 收到
+        // 错误的上下文。
         match self
             .forward_inner(
                 app_type,
@@ -2779,7 +2791,7 @@ impl RequestForwarder {
                 extensions,
                 adapter,
                 true,
-                true,
+                LoopOverridePolicy::SkipAll,
             )
             .await
         {
@@ -3876,10 +3888,25 @@ fn summarize_text_for_log(text: &str, max_chars: usize) -> String {
     format!("{truncated}...")
 }
 
+/// `localProxyRequestOverrides.body` 覆盖的应用策略。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoopOverridePolicy {
+    /// 普通请求：body 覆盖全部照常应用。
+    ApplyAll,
+    /// advisor 回路内 executor 调用：跳过 `messages` 键（整组替换会吞掉回注，codex
+    /// P1），其余键照常。
+    SkipMessages,
+    /// advisor 子调用（内部请求）：跳过全部 body 覆盖。子调用的 Oracle system 与空
+    /// `tools` 是协议要求（防重入靠 `tools` 为空），被 executor 的 system/tools 覆盖
+    /// 顶掉会让 advisor 以 executor 覆盖提示跑、甚至输出 tool_use 而非建议（codex
+    /// P2）；executor 的覆盖值已体现在被引用的转录里。
+    SkipAll,
+}
+
 fn apply_local_proxy_body_overrides(
     body: &mut Value,
     overrides: &LocalProxyRequestOverrides,
-    skip_messages: bool,
+    policy: LoopOverridePolicy,
 ) -> bool {
     let Some(override_body) = overrides.body.as_ref() else {
         return false;
@@ -3890,10 +3917,15 @@ fn apply_local_proxy_body_overrides(
         return false;
     }
 
+    // advisor 子调用是内部请求，不吃 executor 的 body 覆盖（见 LoopOverridePolicy::SkipAll）。
+    if policy == LoopOverridePolicy::SkipAll {
+        return false;
+    }
+
     // advisor 回路内 messages 由回路管理（回注依赖追加语义）；`body.messages` 覆盖是
     // 整组替换，会吞掉回注让 executor 每轮看到相同请求 → 无限付费循环（codex P1）。
     // 跳过该键，其余字段照常覆盖。
-    if skip_messages && override_body.get("messages").is_some() {
+    if policy == LoopOverridePolicy::SkipMessages && override_body.get("messages").is_some() {
         let mut patch = override_body.clone();
         if let Some(obj) = patch.as_object_mut() {
             obj.remove("messages");
@@ -4426,7 +4458,9 @@ mod tests {
         };
 
         assert!(apply_local_proxy_body_overrides(
-            &mut body, &overrides, false
+            &mut body,
+            &overrides,
+            LoopOverridePolicy::ApplyAll
         ));
 
         assert_eq!(body["model"], "after");
@@ -4439,7 +4473,7 @@ mod tests {
 
     #[test]
     fn local_proxy_body_overrides_skip_messages_keeps_conversation() {
-        // advisor 回路内（skip_messages=true）：body.messages 覆盖被跳过（整组替换会
+        // advisor 回路内（SkipMessages）：body.messages 覆盖被跳过（整组替换会
         // 吞掉回注，codex P1），其余字段照常生效。
         let mut body = json!({
             "model": "before",
@@ -4455,13 +4489,49 @@ mod tests {
         };
 
         assert!(apply_local_proxy_body_overrides(
-            &mut body, &overrides, true
+            &mut body,
+            &overrides,
+            LoopOverridePolicy::SkipMessages
         ));
 
         assert_eq!(body["model"], "after");
         assert_eq!(
             body["messages"],
             json!([{ "role": "user", "content": "hello" }])
+        );
+    }
+
+    #[test]
+    fn local_proxy_body_overrides_skip_all_keeps_internal_subcall_body() {
+        // advisor 子调用（SkipAll，codex P2）：Oracle system 与空 tools 是协议要求
+        // （防重入靠 tools 为空），不得被 executor 的 system/tools 覆盖顶掉；messages
+        // 转录同样不被整组替换。
+        let mut body = json!({
+            "model": "advisor-model",
+            "system": "ORACLE_SYSTEM_PROMPT",
+            "tools": [],
+            "messages": [{ "role": "user", "content": "transcript" }]
+        });
+        let overrides = LocalProxyRequestOverrides {
+            headers: HashMap::new(),
+            body: Some(json!({
+                "system": "executor override prompt",
+                "tools": [{ "type": "custom_tool", "name": "bash" }],
+                "messages": [{ "role": "user", "content": "replaced" }]
+            })),
+        };
+
+        assert!(!apply_local_proxy_body_overrides(
+            &mut body,
+            &overrides,
+            LoopOverridePolicy::SkipAll
+        ));
+
+        assert_eq!(body["system"], "ORACLE_SYSTEM_PROMPT");
+        assert_eq!(body["tools"], json!([]));
+        assert_eq!(
+            body["messages"],
+            json!([{ "role": "user", "content": "transcript" }])
         );
     }
 
@@ -4478,7 +4548,9 @@ mod tests {
         };
 
         assert!(!apply_local_proxy_body_overrides(
-            &mut body, &overrides, true
+            &mut body,
+            &overrides,
+            LoopOverridePolicy::SkipMessages
         ));
 
         assert_eq!(body["model"], "keep");
