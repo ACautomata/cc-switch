@@ -482,9 +482,26 @@ impl RequestForwarder {
                 status.current_provider_id = Some(provider.id.clone());
             }
 
+            // advisor 本地降级门控：Claude + anthropic 非流式 + /v1/messages + 第三方
+            // base_url + 含 advisor 服务器工具块 → 走 advisor 回路（failover 钉死本 Provider）。
+            let advisor_active = self.advisor_fallback_active(
+                app_type,
+                endpoint,
+                &provider_body,
+                &headers,
+                provider,
+                adapter.as_ref(),
+            );
+
+            // 注意：advisor 激活时，下方失败分支里的 media/thinking 三个整流器被
+            // `!advisor_active` 停用——它们改写的是**改写前**的 provider_body（仍含
+            // advisor server 块）并经 `forward()` 重发，会绕过 advisor 回路把未剥离的
+            // 块发出去。代价：advisor 会话内命中 thinking 类 400 不再自动整流重试
+            // （属切片 1 错误路径的可接受限制，随切片 2 错误降级统一处理）。
+
             // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
-            match self
-                .forward(
+            let attempt = if advisor_active {
+                self.forward_with_advisor_loop(
                     app_type,
                     &method,
                     provider,
@@ -495,7 +512,20 @@ impl RequestForwarder {
                     adapter.as_ref(),
                 )
                 .await
-            {
+            } else {
+                self.forward(
+                    app_type,
+                    &method,
+                    provider,
+                    endpoint,
+                    &provider_body,
+                    &headers,
+                    &extensions,
+                    adapter.as_ref(),
+                )
+                .await
+            };
+            match attempt {
                 Ok((response, claude_api_format, outbound_model)) => {
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
@@ -557,12 +587,14 @@ impl RequestForwarder {
                     );
                     let mut signature_rectifier_non_retryable_client_error = false;
 
-                    if self.media_retry_should_trigger(
-                        adapter.name(),
-                        media_rectifier_retried,
-                        &provider_body,
-                        &e,
-                    ) {
+                    if !advisor_active
+                        && self.media_retry_should_trigger(
+                            adapter.name(),
+                            media_rectifier_retried,
+                            &provider_body,
+                            &e,
+                        )
+                    {
                         let mut media_body = provider_body.clone();
                         let replaced_images =
                             super::media_sanitizer::replace_image_blocks_with_marker(
@@ -677,10 +709,12 @@ impl RequestForwarder {
 
                     if is_anthropic_provider {
                         let error_message = extract_error_message(&e);
-                        if should_rectify_thinking_signature(
-                            error_message.as_deref(),
-                            &self.rectifier_config,
-                        ) {
+                        if !advisor_active
+                            && should_rectify_thinking_signature(
+                                error_message.as_deref(),
+                                &self.rectifier_config,
+                            )
+                        {
                             // 已经重试过：直接返回错误（不可重试客户端错误）
                             if rectifier_retried {
                                 log::warn!("[{app_type_str}] [RECT-005] 整流器已触发过，不再重试");
@@ -828,10 +862,12 @@ impl RequestForwarder {
                     // 检测是否需要触发 budget 整流器（仅 Claude/ClaudeAuth 供应商）
                     if is_anthropic_provider {
                         let error_message = extract_error_message(&e);
-                        if should_rectify_thinking_budget(
-                            error_message.as_deref(),
-                            &self.rectifier_config,
-                        ) {
+                        if !advisor_active
+                            && should_rectify_thinking_budget(
+                                error_message.as_deref(),
+                                &self.rectifier_config,
+                            )
+                        {
                             // 已经重试过：直接返回错误（不可重试客户端错误）
                             if budget_rectifier_retried {
                                 log::warn!(
@@ -1129,6 +1165,45 @@ impl RequestForwarder {
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+        self.forward_inner(
+            app_type,
+            method,
+            provider,
+            endpoint,
+            body,
+            headers,
+            extensions,
+            adapter,
+            false,
+            LoopOverridePolicy::ApplyAll,
+        )
+        .await
+    }
+
+    /// `forward` 的实现本体。
+    ///
+    /// `skip_model_mapping` 用于「模型已预解析」的调用（如 advisor 子调用）：跳过
+    /// `apply_model_mapping`，避免对最终模型名二次映射（预解析值不含档位关键词时，
+    /// 二次映射会错落到 default）。其余定稿（[1m] 剥离、thinking 归一等）照常。
+    ///
+    /// `override_policy` 控制 `localProxyRequestOverrides.body` 覆盖的应用范围（见
+    /// [`LoopOverridePolicy`]）：普通请求全应用；advisor 回路内 executor 调用跳过
+    /// `messages` 键（整组替换会吞掉回注）；advisor 子调用跳过全部（Oracle 提示与
+    /// 空 tools 是协议要求，不得被 executor 覆盖顶掉）。
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_inner(
+        &self,
+        app_type: &AppType,
+        method: &http::Method,
+        provider: &Provider,
+        endpoint: &str,
+        body: &Value,
+        headers: &axum::http::HeaderMap,
+        extensions: &Extensions,
+        adapter: &dyn ProviderAdapter,
+        skip_model_mapping: bool,
+        override_policy: LoopOverridePolicy,
+    ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
         // 使用适配器提取 base_url
         let mut base_url = adapter.extract_base_url(provider)?;
 
@@ -1165,7 +1240,10 @@ impl RequestForwarder {
         // 应用模型映射（独立于格式转换）
         // Claude Desktop proxy 模式必须先把 Desktop 可见的 claude-* route
         // 映射成真实上游模型名，并且未知 route 要直接报错，不能使用默认模型兜底。
-        let mapped_body = if matches!(app_type, AppType::ClaudeDesktop) {
+        let mapped_body = if skip_model_mapping {
+            // 模型已预解析（advisor 子调用）：直接使用请求体里的模型，不再二次映射。
+            body.clone()
+        } else if matches!(app_type, AppType::ClaudeDesktop) {
             crate::claude_desktop_config::map_proxy_request_model(body.clone(), provider)
                 .map_err(|e| ProxyError::InvalidRequest(e.to_string()))?
         } else {
@@ -1591,7 +1669,8 @@ impl RequestForwarder {
                 .as_ref()
                 .and_then(|meta| meta.local_proxy_request_overrides.as_ref())
             {
-                if apply_local_proxy_body_overrides(&mut filtered_body, overrides) {
+                if apply_local_proxy_body_overrides(&mut filtered_body, overrides, override_policy)
+                {
                     filtered_body = prepare_upstream_request_body(filtered_body);
                 }
             }
@@ -2344,6 +2423,399 @@ impl RequestForwarder {
         }
     }
 
+    /// advisor 本地降级门控（纯判定）。
+    ///
+    /// 命中全部条件才走本地降级回路；任一不满足则普通 forward：
+    /// - 仅 Claude Code 场景（app_type == Claude）且端点为 /v1/messages；
+    /// - 非流式（流式属切片 6）；
+    /// - anthropic 原生透传（需格式转换的端点不适用客户端工具降级）；
+    /// - 第三方 base_url（官方域透传原生 advisor，不降级）；
+    /// - 请求体含 `advisor_20260301` 服务器工具块。
+    fn advisor_fallback_active(
+        &self,
+        app_type: &AppType,
+        endpoint: &str,
+        body: &Value,
+        headers: &axum::http::HeaderMap,
+        provider: &Provider,
+        adapter: &dyn ProviderAdapter,
+    ) -> bool {
+        if !matches!(app_type, AppType::Claude) {
+            return false;
+        }
+        // 端点可能带 query（handlers 用 path_and_query 传入）。先剥 query 再对纯 path 精确
+        // 匹配（对齐 rewrite_claude_transform_endpoint 的先例），否则带 query 时误判为非
+        // /v1/messages → 降级静默关闭、未剥离的 advisor 块 + beta 头直发上游。
+        let (path, _) = split_endpoint_and_query(endpoint);
+        if !is_claude_messages_path(path) {
+            return false;
+        }
+        if is_streaming_request(endpoint, body, headers) {
+            return false;
+        }
+        // 切片 1 只覆盖 anthropic 透传端点（块形状 advisor_tool_result/tool_use 是
+        // anthropic 契约）；需格式转换的 openai_chat/openai_responses 网关的 advisor
+        // 降级须走 OpenAI function 模型，是另一个更难的子问题，属后续切片。
+        if adapter.needs_transform(provider) {
+            return false;
+        }
+        let Ok(base_url) = adapter.extract_base_url(provider) else {
+            return false;
+        };
+        if !super::advisor::should_local_fallback(&base_url) {
+            return false;
+        }
+        super::advisor::has_advisor_tool(body)
+    }
+
+    /// advisor 本地降级回路（非流式成功路径，issue #21 切片 1）。
+    ///
+    /// 一次客户端请求内部：改写请求（剥 advisor server 块、注入客户端工具、剥 beta 头）
+    /// → forward 给 executor → 若捕获 advisor `tool_use` 则起本地子调用取建议 → 回注 →
+    /// 续跑 executor → 循环直到 executor 不再调 advisor → 返回最终响应。整个 advisor
+    /// 往返对客户端透明（客户端只看到一次请求-响应）。failover 钉死本 Provider（复用其
+    /// 端点/凭证，不重走 router）。
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_with_advisor_loop(
+        &self,
+        app_type: &AppType,
+        method: &http::Method,
+        provider: &Provider,
+        endpoint: &str,
+        body: &Value,
+        headers: &axum::http::HeaderMap,
+        extensions: &Extensions,
+        adapter: &dyn ProviderAdapter,
+    ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+        // 1. 请求侧改写：剥 advisor server 块 → 注入无参客户端工具 advisor。
+        let mut loop_body = body.clone();
+        let Some(capture) = super::advisor::rewrite_request(&mut loop_body) else {
+            // 门控已保证含 advisor 块；防御 None 则退化为单次 forward。
+            return self
+                .forward(
+                    app_type, method, provider, endpoint, body, headers, extensions, adapter,
+                )
+                .await;
+        };
+
+        // 2. 按值剥 advisor beta 头（本地用明文块变体，不依赖该头）。
+        let stripped_headers = super::advisor::strip_advisor_beta_from_headers(headers);
+
+        // 3. 进回路前应用一次 `body.messages` 覆盖（codex P2）：advisor 请求与普通请求
+        //    应看到同一份被覆盖的消息，否则同 provider 下行为分叉（普通请求见替换后
+        //    messages、advisor 请求见原始 messages）。回路内 forward_inner 以
+        //    SkipMessages 跳过重复应用（整组替换会吞掉回注）。
+        //    只应用 messages 键——其余键（如 model）在 forward_inner 内部模型映射
+        //    **之后**应用，提前应用会改变映射输入。copilot 走转换层，advisor 门控
+        //    （needs_transform）已排除，无需 is_copilot 门。
+        if let Some(override_messages) = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.local_proxy_request_overrides.as_ref())
+            .and_then(|overrides| overrides.body.as_ref())
+            .and_then(|body| body.get("messages"))
+        {
+            loop_body["messages"] = override_messages.clone();
+        }
+
+        let mapping = super::model_mapper::ModelMapping::from_provider(provider);
+        let executor_max_tokens = loop_body
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_ADVISOR_MAX_TOKENS);
+
+        let mut use_tool_result_fallback = false;
+        // 最近一次尚未被下游确认接受的 advisor_tool_result 回注（仅该形状才可能被拒，
+        // 用于 advisor_tool_result → tool_result 回退）；tool_result 回注无回退对象，置 None。
+        let mut pending: Option<PendingInjection> = None;
+        let mut executor_mapped_model: Option<String> = None;
+        // 已发起的 advisor 调用数（并行多 id 逐个计），执行客户端 max_uses 上限。
+        let mut advisor_uses: u64 = 0;
+
+        // 循环直到 executor 不再调 advisor。终止保险三道：客户端 max_uses 上限
+        // （can_use_advisor，达到后不再发子调用）；转录每轮增长，executor 上下文溢出时
+        // 其 forward 报错、回路随之终止；executor 自行停止调用（常态）。客户端未设
+        // 上限时无第一道（US-34：cc-switch 不自造上限）。
+        loop {
+            // advisor 回路内调用：模型照常映射（false），messages 覆盖须跳过
+            // （SkipMessages）——body.messages 整组替换会吞掉回注（codex P1）。
+            let attempt = self
+                .forward_inner(
+                    app_type,
+                    method,
+                    provider,
+                    endpoint,
+                    &loop_body,
+                    &stripped_headers,
+                    extensions,
+                    adapter,
+                    false,
+                    LoopOverridePolicy::SkipMessages,
+                )
+                .await;
+            let (response, claude_api_format, outbound_model) = match attempt {
+                Ok(ok) => ok,
+                Err(e) => {
+                    // 下游对 advisor_tool_result 未知块报错 → 回退普通 tool_result 重发一次。
+                    if !use_tool_result_fallback && is_advisor_block_rejection(&e) {
+                        if let Some(p) = pending.take() {
+                            use_tool_result_fallback = true;
+                            log::info!(
+                                "[Advisor] 下游拒绝 advisor_tool_result，回退普通 tool_result 重发"
+                            );
+                            rebuild_continuation_as_tool_result(&mut loop_body, &p);
+                            continue;
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+
+            if executor_mapped_model.is_none() {
+                executor_mapped_model = outbound_model.clone().or_else(|| {
+                    loop_body
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                });
+            }
+
+            // 自行缓冲为 `Buffered`（不依赖 failover 的缓冲副作用——failover 关闭的
+            // 默认配置下 forward 返回未缓冲变体，codex P1），再解析 JSON；解析失败
+            // （非 JSON 体）视为终态原样返回。
+            let response = buffer_response_for_advisor(response).await?;
+            let Some(resp_json) = buffered_json(&response) else {
+                return Ok((response, claude_api_format, outbound_model));
+            };
+            // 2xx 错误信封：部分网关用 HTTP 200 + {"type":"error",…} 报拒绝（先例：
+            // validate_codex_anthropic_success_response）。若刚回注过 advisor_tool_result，
+            // 这是「下游拒绝该未知块」的另一种表现形式——同样触发 tool_result 回退
+            // 重试，否则回退被绕过、信封被当成功终态返回（codex P2）。无 pending 时
+            // 维持终态透传（与普通 Claude 透传路径一致）。
+            if !use_tool_result_fallback
+                && super::advisor::is_error_envelope(&resp_json)
+                && pending.is_some()
+            {
+                if let Some(p) = pending.take() {
+                    use_tool_result_fallback = true;
+                    log::info!(
+                        "[Advisor] 下游以 2xx 错误信封拒绝 advisor_tool_result，回退普通 tool_result 重发"
+                    );
+                    rebuild_continuation_as_tool_result(&mut loop_body, &p);
+                    continue;
+                }
+            }
+            // 无 advisor 调用 → 终态，把最终响应返给客户端（对客户端透明）。
+            let Some(calls) = super::advisor::find_advisor_calls(&resp_json) else {
+                return Ok((response, claude_api_format, outbound_model));
+            };
+            // 混合轮：advisor 与其它客户端工具同轮并行。代理只能答 advisor、无法代执行外部
+            // 工具，强行内部续跑会留下未配对 tool_use（严格端点 400）。回退终态、原样返给
+            // 客户端（稀有并行调用的可接受降级；代价是注入的 advisor 客户端工具暴露给 Claude Code）。
+            if calls.has_external_tool_use {
+                log::warn!(
+                    "[Advisor] advisor 与其它客户端工具同轮并行，无法透明续跑，回退终态返回"
+                );
+                return Ok((response, claude_api_format, outbound_model));
+            }
+
+            // 捕获到 advisor 调用（可能并行多个）→ 起本地子调用取建议。达到客户端
+            // max_uses 上限后不再发起子调用，回注明文让 executor 继续（codex P1；
+            // 官方端点由服务端强制上限，本地降级由回路代为执行，不本地复刻
+            // max_uses_exceeded 错误块）。并行多 id 逐个计数（同轮共享一次子调用）。
+            //
+            // 回注形状三分支（US-26 / 数据契约 + codex P2）：子调用成功 →
+            // advisor_tool_result（下游拒绝过则回退 tool_result，stop_reason 透传进
+            // advisor_result 变体）；子调用失败与上限耗尽 → 一律普通 tool_result 明文
+            // （CONTEXT.md 契约：与失败降级同形状；上限明文走成功形状会被宽容 executor
+            // 当真建议收下、严格网关多付一轮拒绝重试）。
+            // 构造回注（assistant 含 tool_use 的消息 + 下一条 user 消息）并 append 进 messages。
+            let assistant_content = resp_json.get("content").cloned().unwrap_or(Value::Null);
+            let (advice, stop_reason, shape) =
+                if super::advisor::can_use_advisor(advisor_uses, capture.max_uses) {
+                    advisor_uses += calls.ids.len() as u64;
+                    match self
+                        .run_advisor_subcall(
+                            app_type,
+                            method,
+                            provider,
+                            endpoint,
+                            &stripped_headers,
+                            extensions,
+                            adapter,
+                            &loop_body,
+                            &resp_json,
+                            &capture,
+                            &mapping,
+                            executor_mapped_model.as_deref(),
+                            executor_max_tokens,
+                        )
+                        .await
+                    {
+                        Some(a) => {
+                            let shape = if use_tool_result_fallback {
+                                super::advisor::InjectShape::ToolResult
+                            } else {
+                                super::advisor::InjectShape::AdvisorToolResult
+                            };
+                            (a.text, a.stop_reason, shape)
+                        }
+                        None => (
+                            super::advisor::unavailable_advice(),
+                            None,
+                            super::advisor::InjectShape::ToolResult,
+                        ),
+                    }
+                } else {
+                    log::info!(
+                        "[Advisor] advisor 调用次数已达客户端上限 max_uses={}，跳过子调用",
+                        capture.max_uses.unwrap_or_default()
+                    );
+                    (
+                        super::advisor::limit_reached_advice(capture.max_uses.unwrap_or_default()),
+                        None,
+                        super::advisor::InjectShape::ToolResult,
+                    )
+                };
+            // 并行多调用逐个回链（每个 advisor tool_use 都得有配对结果）；同轮同转录，
+            // 各调用共享同一份建议。
+            let continuation = super::advisor::build_continuation(
+                &assistant_content,
+                &calls.ids,
+                &advice,
+                stop_reason.as_deref(),
+                shape,
+            );
+            let base_len = loop_body
+                .get("messages")
+                .and_then(Value::as_array)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if let Some(arr) = loop_body.get_mut("messages").and_then(Value::as_array_mut) {
+                arr.extend(continuation);
+            }
+            // 回注后剥除强制 tool_choice（codex P1）：tool_choice 是单请求参数，官方
+            // 语义一次请求只强制一次；原样保留会让每轮续跑都被迫再调 advisor → 重复
+            // 付费循环直到上下文溢出。强制调用已发生并已回注，续跑轮恢复自由选择。
+            if super::advisor::strip_forced_tool_choice(&mut loop_body) {
+                log::debug!("[Advisor] 已剥除续跑轮的强制 tool_choice");
+            }
+            // 仅 advisor_tool_result 形状才可能被下游拒绝 → 记录 pending 以备回退。
+            pending = match shape {
+                super::advisor::InjectShape::AdvisorToolResult => Some(PendingInjection {
+                    base_len,
+                    assistant_content,
+                    tool_use_ids: calls.ids.clone(),
+                    advice,
+                }),
+                super::advisor::InjectShape::ToolResult => None,
+            };
+            // 续跑 executor（进入下一轮 loop）。
+        }
+    }
+
+    /// 起一次 advisor 子调用，返回建议（文本 + 终止原因；`None` = 子调用失败或取不到
+    /// 有效建议）。
+    ///
+    /// Oracle 系统提示 + 完整转录 + 空 `tools`、`max_tokens` 沿用 executor、模型经
+    /// `model_mapper` 分档映射（未配该档回落 executor 已映射模型）。复用 forwarder
+    /// （熔断/用量记录）但跳过模型二次映射（模型已解析）。`None` 由调用方以普通
+    /// `tool_result` 明文「不可用」回注（最小安全网，不 5xx；六码归因属切片 2）。
+    /// 子调用撞 `max_tokens` 天花板时按官方形状追加截断标记（codex P2）。
+    #[allow(clippy::too_many_arguments)]
+    async fn run_advisor_subcall(
+        &self,
+        app_type: &AppType,
+        method: &http::Method,
+        provider: &Provider,
+        endpoint: &str,
+        headers: &axum::http::HeaderMap,
+        extensions: &Extensions,
+        adapter: &dyn ProviderAdapter,
+        loop_body: &Value,
+        executor_response: &Value,
+        capture: &super::advisor::AdvisorCapture,
+        mapping: &super::model_mapper::ModelMapping,
+        executor_mapped_model: Option<&str>,
+        executor_max_tokens: u64,
+    ) -> Option<super::advisor::Advice> {
+        let executor_model = executor_mapped_model
+            .map(str::to_string)
+            .or_else(|| {
+                loop_body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            })
+            .unwrap_or_default();
+        let advisor_model = super::advisor::resolve_advisor_model(
+            capture.model.as_deref(),
+            &executor_model,
+            mapping,
+        );
+
+        // 完整转录 = 既有 messages + 本轮 assistant 响应；本轮文本 = 响应里的 text 块。
+        let content = executor_response
+            .get("content")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let current_text = super::advisor::join_text_blocks(&content);
+        // 转录引用前剥 `_` 前缀私有字段：loop_body 未经过 prepare_upstream_request_body
+        //（过滤发生在 forward_inner 内部的出站路径），直接引用会把私有字段（如
+        // _session_token）泄进 advisor 转录；一旦序列进转录字符串，子调用出站过滤就再也
+        // 看不到这些键。与 executor 出站口径一致地先过滤（只需私有字段剥离，无需 canonicalize）。
+        let filtered_body = filter_private_params_with_whitelist(loop_body.clone(), &[]);
+        let mut conversation = filtered_body
+            .get("messages")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
+        if let Some(arr) = conversation.as_array_mut() {
+            arr.push(serde_json::json!({ "role": "assistant", "content": content }));
+        }
+        let transcript = super::advisor::build_transcript(
+            filtered_body.get("system"),
+            filtered_body.get("tools"),
+            &conversation,
+            &current_text,
+        );
+        let subcall_body =
+            super::advisor::build_subcall_body(&advisor_model, executor_max_tokens, &transcript);
+
+        // 复用 forwarder 路径，跳过模型二次映射（模型已预解析）；body 覆盖整体跳过
+        // （SkipAll）——子调用的 Oracle system 与空 tools 是协议要求，被 executor 的
+        // system/tools 覆盖顶掉会让 advisor 以错误提示跑、甚至输出 tool_use 而非建议
+        // （codex P2）；转录在 messages 里，messages 整组替换同样会让 advisor 收到
+        // 错误的上下文。
+        match self
+            .forward_inner(
+                app_type,
+                method,
+                provider,
+                endpoint,
+                &subcall_body,
+                headers,
+                extensions,
+                adapter,
+                true,
+                LoopOverridePolicy::SkipAll,
+            )
+            .await
+        {
+            Ok((resp, _, _)) => buffer_response_for_advisor(resp)
+                .await
+                .ok()
+                .and_then(|resp| buffered_json(&resp))
+                // 建议被 max_tokens 截断时追加官方标记，executor 才能区分完整建议与
+                // 半句截断（codex P2）。
+                .and_then(|j| super::advisor::extract_advice(&j))
+                .map(|advice| super::advisor::annotate_truncation(advice, executor_max_tokens)),
+            Err(e) => {
+                log::warn!("[Advisor] 子调用失败，回注「不可用」让 executor 继续: {e}");
+                None
+            }
+        }
+    }
+
     /// 故障转移开启时，成功不能只看上游响应头。
     ///
     /// - 非流式：先把完整 body 读到内存，读超时/连接中断会回到 retry loop 尝试下一家。
@@ -2865,6 +3337,88 @@ fn is_claude_messages_path(path: &str) -> bool {
     matches!(path, "/v1/messages" | "/claude/v1/messages")
 }
 
+/// executor 未提供 `max_tokens` 时 advisor 子调用的兜底值。
+/// （切片 1 沿用 executor 值；此仅为防御性兜底，正常 Claude Code 请求恒有 max_tokens。）
+const DEFAULT_ADVISOR_MAX_TOKENS: u64 = 8192;
+
+/// 把 advisor 回路内的成功响应统一缓冲为 `Buffered` 变体。
+///
+/// failover 关闭（默认配置）时 `non_streaming_timeout` 为 0，
+/// `prepare_success_response_for_failover` 会原样返回未缓冲的 `Hyper`/`Reqwest` 响应，
+/// 而 `buffered_json` 只认 `Buffered`——回路不能依赖 failover 的缓冲副作用（否则默认
+/// 配置下 executor 的 advisor 调用被当终态静默返回，codex P1），须自行缓冲。
+/// 压缩体不在这一层解压：保留原 `Content-Encoding` 头，交 `buffered_json` 统一处理。
+async fn buffer_response_for_advisor(response: ProxyResponse) -> Result<ProxyResponse, ProxyError> {
+    if matches!(response, ProxyResponse::Buffered { .. }) {
+        return Ok(response);
+    }
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES).await?;
+    Ok(ProxyResponse::buffered(status, headers, body))
+}
+
+/// 读取非流式（Buffered）响应体并解析为 JSON；非 Buffered 或解析失败返回 None。
+///
+/// 上游可能对非流式透传响应压缩（`Content-Encoding: gzip/br/zstd`）；reqwest 未启用
+/// 自动解压，`Buffered` 里是原始字节。直接 `from_slice` 会把压缩体误判为「非 JSON」，让
+/// advisor 回路把 executor 的 advisor 调用当终态静默返回（codex P1）。故按 `Content-Encoding`
+/// 解压后再解析；不支持的编码 / 解压失败则退回原始字节（多半解析失败 → None，与原行为一致）。
+fn buffered_json(response: &ProxyResponse) -> Option<Value> {
+    let ProxyResponse::Buffered { body, headers, .. } = response else {
+        return None;
+    };
+    let raw: &[u8] = body.as_ref();
+    let decompressed = get_content_encoding(headers).and_then(|enc| {
+        decompress_body_with_limit(&enc, raw, MAX_RESPONSE_BODY_BYTES)
+            .ok()
+            .flatten()
+    });
+    let bytes: &[u8] = decompressed.as_deref().unwrap_or(raw);
+    serde_json::from_slice(bytes).ok()
+}
+
+/// 判断是否为「下游拒绝 `advisor_tool_result` 未知块」类的客户端校验错误（400/422）。
+///
+/// 本地降级默认回注 `advisor_tool_result`；第三方 executor 对未知块 type 校验严格时报
+/// 400（原型 #7 实测 k3 如此），据此触发回退普通 `tool_result`（ADR-0002 题 4）。
+fn is_advisor_block_rejection(error: &ProxyError) -> bool {
+    matches!(error, ProxyError::UpstreamError { status, .. } if *status == 400 || *status == 422)
+}
+
+/// advisor 回路中最近一次注入的 `advisor_tool_result` 回注快照。
+///
+/// 仅当本轮回注为 `advisor_tool_result` 形状时记录，供下游拒绝该未知块（400/422，或
+/// 2xx 错误信封）时回退重发普通 `tool_result`：截断到 `base_len`、用同一份内容以
+/// `tool_result` 重建。
+struct PendingInjection {
+    /// 追加回注前 `messages` 的长度（回退时截断至此）。
+    base_len: usize,
+    /// 含 advisor `tool_use` 的 assistant 消息 content。
+    assistant_content: Value,
+    /// 被回注的 advisor `tool_use.id`（可能并行多个），回链用。
+    tool_use_ids: Vec<String>,
+    /// 建议明文。
+    advice: String,
+}
+
+/// 把回退快照重建为普通 `tool_result` 回注：截断 `messages` 至 `base_len`、用同一份
+/// 内容以 `tool_result` 形状重建。「下游拒绝 `advisor_tool_result`」的两条路径
+/// （HTTP 400/422 与 2xx 错误信封）共用。
+fn rebuild_continuation_as_tool_result(loop_body: &mut Value, pending: &PendingInjection) {
+    if let Some(arr) = loop_body.get_mut("messages").and_then(Value::as_array_mut) {
+        arr.truncate(pending.base_len);
+        // tool_result 明文形状无 stop_reason 字段；截断标记（如有）已嵌在 advice 文本里。
+        arr.extend(super::advisor::build_continuation(
+            &pending.assistant_content,
+            &pending.tool_use_ids,
+            &pending.advice,
+            None,
+            super::advisor::InjectShape::ToolResult,
+        ));
+    }
+}
+
 fn rewrite_codex_responses_endpoint_to_chat(endpoint: &str) -> (String, Option<String>) {
     let (_path, query) = split_endpoint_and_query(endpoint);
     let passthrough_query = query.map(ToString::to_string);
@@ -3340,9 +3894,25 @@ fn summarize_text_for_log(text: &str, max_chars: usize) -> String {
     format!("{truncated}...")
 }
 
+/// `localProxyRequestOverrides.body` 覆盖的应用策略。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoopOverridePolicy {
+    /// 普通请求：body 覆盖全部照常应用。
+    ApplyAll,
+    /// advisor 回路内 executor 调用：跳过 `messages` 键（整组替换会吞掉回注，codex
+    /// P1），其余键照常。
+    SkipMessages,
+    /// advisor 子调用（内部请求）：跳过全部 body 覆盖。子调用的 Oracle system 与空
+    /// `tools` 是协议要求（防重入靠 `tools` 为空），被 executor 的 system/tools 覆盖
+    /// 顶掉会让 advisor 以 executor 覆盖提示跑、甚至输出 tool_use 而非建议（codex
+    /// P2）；executor 的覆盖值已体现在被引用的转录里。
+    SkipAll,
+}
+
 fn apply_local_proxy_body_overrides(
     body: &mut Value,
     overrides: &LocalProxyRequestOverrides,
+    policy: LoopOverridePolicy,
 ) -> bool {
     let Some(override_body) = overrides.body.as_ref() else {
         return false;
@@ -3351,6 +3921,29 @@ fn apply_local_proxy_body_overrides(
     if !override_body.is_object() {
         log::warn!("[LocalProxyOverrides] Ignoring body override because it is not an object");
         return false;
+    }
+
+    // advisor 子调用是内部请求，不吃 executor 的 body 覆盖（见 LoopOverridePolicy::SkipAll）。
+    if policy == LoopOverridePolicy::SkipAll {
+        return false;
+    }
+
+    // advisor 回路内 messages 由回路管理（回注依赖追加语义）；`body.messages` 覆盖是
+    // 整组替换，会吞掉回注让 executor 每轮看到相同请求 → 无限付费循环（codex P1）。
+    // 跳过该键，其余字段照常覆盖。
+    if policy == LoopOverridePolicy::SkipMessages && override_body.get("messages").is_some() {
+        let mut patch = override_body.clone();
+        if let Some(obj) = patch.as_object_mut() {
+            obj.remove("messages");
+        }
+        log::warn!(
+            "[Advisor] localProxyRequestOverrides.body.messages 为整组替换、会吞掉 advisor \
+             回注，advisor 回路内跳过该键（其余覆盖照常生效）"
+        );
+        if patch.as_object().is_some_and(|o| o.is_empty()) {
+            return false;
+        }
+        return merge_json_override(body, &patch);
     }
 
     merge_json_override(body, override_body)
@@ -3782,6 +4375,71 @@ mod tests {
     }
 
     #[test]
+    fn buffered_json_parses_plain_body() {
+        let resp = ProxyResponse::buffered(
+            StatusCode::OK,
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"content":[]}"#),
+        );
+        assert_eq!(buffered_json(&resp), Some(json!({"content": []})));
+    }
+
+    #[test]
+    fn buffered_json_decompresses_gzip_before_parse() {
+        // 上游对非流式透传响应 gzip 压缩：reqwest 不自动解压，须按 Content-Encoding 解压
+        // 后再解析，否则压缩体被误判为「非 JSON」→ advisor 回路静默失效（codex P1）。
+        let payload = br#"{"content":[{"type":"tool_use","name":"advisor","id":"toolu_1"}]}"#;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", HeaderValue::from_static("gzip"));
+        let resp = ProxyResponse::buffered(StatusCode::OK, headers, Bytes::from(compressed));
+
+        // 压缩体直接 from_slice 必然失败；解压后应能解析出 advisor tool_use。
+        assert_eq!(
+            buffered_json(&resp),
+            Some(json!({"content": [{"type": "tool_use", "name": "advisor", "id": "toolu_1"}]}))
+        );
+    }
+
+    #[test]
+    fn rebuild_continuation_as_tool_result_truncates_and_rebuilds() {
+        // 回退：截断到 base_len、同一份内容以 tool_result 重建（400/422 与 2xx 信封共用）。
+        let mut body = json!({
+            "messages": [
+                { "role": "user", "content": "q" },
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "toolu_a", "name": "advisor", "input": {} }
+                ] },
+                { "role": "user", "content": [
+                    { "type": "advisor_tool_result", "tool_use_id": "toolu_a",
+                      "content": { "type": "advisor_result", "text": "建议" } }
+                ] }
+            ]
+        });
+        let pending = PendingInjection {
+            base_len: 1,
+            assistant_content: json!([
+                { "type": "tool_use", "id": "toolu_a", "name": "advisor", "input": {} }
+            ]),
+            tool_use_ids: vec!["toolu_a".to_string()],
+            advice: "建议".to_string(),
+        };
+
+        rebuild_continuation_as_tool_result(&mut body, &pending);
+
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(
+            msgs[2]["content"][0],
+            json!({ "type": "tool_result", "tool_use_id": "toolu_a", "content": "建议" })
+        );
+    }
+
+    #[test]
     fn local_proxy_body_overrides_deep_merge_final_body_without_stream() {
         let mut body = json!({
             "model": "before",
@@ -3805,7 +4463,11 @@ mod tests {
             })),
         };
 
-        assert!(apply_local_proxy_body_overrides(&mut body, &overrides));
+        assert!(apply_local_proxy_body_overrides(
+            &mut body,
+            &overrides,
+            LoopOverridePolicy::ApplyAll
+        ));
 
         assert_eq!(body["model"], "after");
         assert_eq!(body["stream"], false);
@@ -3813,6 +4475,95 @@ mod tests {
         assert_eq!(body["metadata"]["temperature"], 0.2);
         assert_eq!(body["metadata"]["top_p"], 0.9);
         assert_eq!(body["messages"], json!([]));
+    }
+
+    #[test]
+    fn local_proxy_body_overrides_skip_messages_keeps_conversation() {
+        // advisor 回路内（SkipMessages）：body.messages 覆盖被跳过（整组替换会
+        // 吞掉回注，codex P1），其余字段照常生效。
+        let mut body = json!({
+            "model": "before",
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        let overrides = LocalProxyRequestOverrides {
+            headers: HashMap::new(),
+            body: Some(json!({
+                "model": "after",
+                "messages": [{ "role": "user", "content": "replaced" }]
+            })),
+        };
+
+        assert!(apply_local_proxy_body_overrides(
+            &mut body,
+            &overrides,
+            LoopOverridePolicy::SkipMessages
+        ));
+
+        assert_eq!(body["model"], "after");
+        assert_eq!(
+            body["messages"],
+            json!([{ "role": "user", "content": "hello" }])
+        );
+    }
+
+    #[test]
+    fn local_proxy_body_overrides_skip_all_keeps_internal_subcall_body() {
+        // advisor 子调用（SkipAll，codex P2）：Oracle system 与空 tools 是协议要求
+        // （防重入靠 tools 为空），不得被 executor 的 system/tools 覆盖顶掉；messages
+        // 转录同样不被整组替换。
+        let mut body = json!({
+            "model": "advisor-model",
+            "system": "ORACLE_SYSTEM_PROMPT",
+            "tools": [],
+            "messages": [{ "role": "user", "content": "transcript" }]
+        });
+        let overrides = LocalProxyRequestOverrides {
+            headers: HashMap::new(),
+            body: Some(json!({
+                "system": "executor override prompt",
+                "tools": [{ "type": "custom_tool", "name": "bash" }],
+                "messages": [{ "role": "user", "content": "replaced" }]
+            })),
+        };
+
+        assert!(!apply_local_proxy_body_overrides(
+            &mut body,
+            &overrides,
+            LoopOverridePolicy::SkipAll
+        ));
+
+        assert_eq!(body["system"], "ORACLE_SYSTEM_PROMPT");
+        assert_eq!(body["tools"], json!([]));
+        assert_eq!(
+            body["messages"],
+            json!([{ "role": "user", "content": "transcript" }])
+        );
+    }
+
+    #[test]
+    fn local_proxy_body_overrides_skip_messages_with_only_messages_patch() {
+        // patch 只含 messages：剥掉后为空 → 无任何改动。
+        let mut body = json!({
+            "model": "keep",
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        let overrides = LocalProxyRequestOverrides {
+            headers: HashMap::new(),
+            body: Some(json!({ "messages": [] })),
+        };
+
+        assert!(!apply_local_proxy_body_overrides(
+            &mut body,
+            &overrides,
+            LoopOverridePolicy::SkipMessages
+        ));
+
+        assert_eq!(body["model"], "keep");
+        assert_eq!(
+            body["messages"],
+            json!([{ "role": "user", "content": "hello" }])
+        );
     }
 
     #[test]
