@@ -450,6 +450,16 @@ pub fn resolve_advisor_model(
         .unwrap_or_else(|| executor_mapped_model.to_string())
 }
 
+/// 判断已解析的响应体是否为 Anthropic 错误信封（HTTP 2xx + `{"type":"error",…}`）。
+///
+/// 部分 Anthropic 兼容网关用 2xx 状态码 + 错误信封报拒绝（先例：
+/// `validate_codex_anthropic_success_response`）。正常 `message` 响应顶层 `type` 为
+/// `message` 且无 `error` 字段，不会误判。advisor 回路据此在终态判定前识别信封，
+/// 避免「下游以 2xx 信封拒绝 `advisor_tool_result`」绕过 `tool_result` 回退（codex P2）。
+pub fn is_error_envelope(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("error") || value.get("error").is_some()
+}
+
 /// 切片 1 的「子调用失败」最小安全网明文。
 ///
 /// 复用成功路径的普通 `tool_result` 形状（零新机制、零分叉），让 executor 不带建议
@@ -869,5 +879,32 @@ mod tests {
     #[test]
     fn unavailable_advice_nonempty() {
         assert!(!unavailable_advice().is_empty());
+    }
+
+    // ---------- 2xx 错误信封 ----------
+
+    #[test]
+    fn error_envelope_detected() {
+        // 官方信封形状：type=error + error 对象
+        assert!(is_error_envelope(&json!({
+            "type": "error",
+            "error": { "type": "invalid_request_error", "message": "unknown block advisor_tool_result" }
+        })));
+        // 简化形状：顶层 error 字段
+        assert!(is_error_envelope(&json!({ "error": "boom" })));
+    }
+
+    #[test]
+    fn error_envelope_not_matched_by_normal_responses() {
+        // 正常 message 响应与 advisor 子调用响应都不会误判
+        assert!(!is_error_envelope(&json!({
+            "type": "message",
+            "content": [{ "type": "text", "text": "ok" }],
+            "usage": { "input_tokens": 1 }
+        })));
+        assert!(!is_error_envelope(
+            &json!({ "content": [{ "type": "tool_use", "id": "t", "name": "advisor" }] })
+        ));
+        assert!(!is_error_envelope(&json!({})));
     }
 }

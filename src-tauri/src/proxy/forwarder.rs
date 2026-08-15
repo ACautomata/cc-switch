@@ -1160,7 +1160,7 @@ impl RequestForwarder {
         adapter: &dyn ProviderAdapter,
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
         self.forward_inner(
-            app_type, method, provider, endpoint, body, headers, extensions, adapter, false,
+            app_type, method, provider, endpoint, body, headers, extensions, adapter, false, false,
         )
         .await
     }
@@ -1170,6 +1170,11 @@ impl RequestForwarder {
     /// `skip_model_mapping` 用于「模型已预解析」的调用（如 advisor 子调用）：跳过
     /// `apply_model_mapping`，避免对最终模型名二次映射（预解析值不含档位关键词时，
     /// 二次映射会错落到 default）。其余定稿（[1m] 剥离、thinking 归一等）照常。
+    ///
+    /// `skip_message_overrides` 用于 advisor 回路内的调用：`localProxyRequestOverrides`
+    /// 的 `body.messages` 是整组替换，会吞掉回路追加的回注、让 executor 每轮看到相同
+    /// 请求（无限付费循环，codex P1）——回路内 messages 由回路管理，该键跳过、其余
+    /// 覆盖照常生效。
     #[allow(clippy::too_many_arguments)]
     async fn forward_inner(
         &self,
@@ -1182,6 +1187,7 @@ impl RequestForwarder {
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
         skip_model_mapping: bool,
+        skip_message_overrides: bool,
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
         // 使用适配器提取 base_url
         let mut base_url = adapter.extract_base_url(provider)?;
@@ -1648,7 +1654,11 @@ impl RequestForwarder {
                 .as_ref()
                 .and_then(|meta| meta.local_proxy_request_overrides.as_ref())
             {
-                if apply_local_proxy_body_overrides(&mut filtered_body, overrides) {
+                if apply_local_proxy_body_overrides(
+                    &mut filtered_body,
+                    overrides,
+                    skip_message_overrides,
+                ) {
                     filtered_body = prepare_upstream_request_body(filtered_body);
                 }
             }
@@ -2494,8 +2504,10 @@ impl RequestForwarder {
         // 循环直到 executor 不再调 advisor（US-34：本地不自造上限）。转录每轮增长，
         // executor 上下文溢出时其 forward 报错、回路随之终止，无真死循环。
         loop {
+            // advisor 回路内调用：模型照常映射（false），messages 覆盖须跳过（true）——
+            // body.messages 整组替换会吞掉回注（codex P1）。
             let attempt = self
-                .forward(
+                .forward_inner(
                     app_type,
                     method,
                     provider,
@@ -2504,6 +2516,8 @@ impl RequestForwarder {
                     &stripped_headers,
                     extensions,
                     adapter,
+                    false,
+                    true,
                 )
                 .await;
             let (response, claude_api_format, outbound_model) = match attempt {
@@ -2516,17 +2530,7 @@ impl RequestForwarder {
                             log::info!(
                                 "[Advisor] 下游拒绝 advisor_tool_result，回退普通 tool_result 重发"
                             );
-                            if let Some(arr) =
-                                loop_body.get_mut("messages").and_then(Value::as_array_mut)
-                            {
-                                arr.truncate(p.base_len);
-                                arr.extend(super::advisor::build_continuation(
-                                    &p.assistant_content,
-                                    &p.tool_use_ids,
-                                    &p.advice,
-                                    super::advisor::InjectShape::ToolResult,
-                                ));
-                            }
+                            rebuild_continuation_as_tool_result(&mut loop_body, &p);
                             continue;
                         }
                     }
@@ -2543,10 +2547,31 @@ impl RequestForwarder {
                 });
             }
 
-            // 非流式 executor 响应应为 Buffered JSON；否则视为终态原样返回。
+            // 自行缓冲为 `Buffered`（不依赖 failover 的缓冲副作用——failover 关闭的
+            // 默认配置下 forward 返回未缓冲变体，codex P1），再解析 JSON；解析失败
+            // （非 JSON 体）视为终态原样返回。
+            let response = buffer_response_for_advisor(response).await?;
             let Some(resp_json) = buffered_json(&response) else {
                 return Ok((response, claude_api_format, outbound_model));
             };
+            // 2xx 错误信封：部分网关用 HTTP 200 + {"type":"error",…} 报拒绝（先例：
+            // validate_codex_anthropic_success_response）。若刚回注过 advisor_tool_result，
+            // 这是「下游拒绝该未知块」的另一种表现形式——同样触发 tool_result 回退
+            // 重试，否则回退被绕过、信封被当成功终态返回（codex P2）。无 pending 时
+            // 维持终态透传（与普通 Claude 透传路径一致）。
+            if !use_tool_result_fallback
+                && super::advisor::is_error_envelope(&resp_json)
+                && pending.is_some()
+            {
+                if let Some(p) = pending.take() {
+                    use_tool_result_fallback = true;
+                    log::info!(
+                        "[Advisor] 下游以 2xx 错误信封拒绝 advisor_tool_result，回退普通 tool_result 重发"
+                    );
+                    rebuild_continuation_as_tool_result(&mut loop_body, &p);
+                    continue;
+                }
+            }
             // 无 advisor 调用 → 终态，把最终响应返给客户端（对客户端透明）。
             let Some(calls) = super::advisor::find_advisor_calls(&resp_json) else {
                 return Ok((response, claude_api_format, outbound_model));
@@ -2689,7 +2714,8 @@ impl RequestForwarder {
         let subcall_body =
             super::advisor::build_subcall_body(&advisor_model, executor_max_tokens, &transcript);
 
-        // 复用 forwarder 路径，跳过模型二次映射（模型已预解析）。
+        // 复用 forwarder 路径，跳过模型二次映射（模型已预解析）；messages 覆盖同样
+        // 跳过——子调用转录在 messages 里，被整组替换会让 advisor 收到错误的上下文。
         match self
             .forward_inner(
                 app_type,
@@ -2701,12 +2727,15 @@ impl RequestForwarder {
                 extensions,
                 adapter,
                 true,
+                true,
             )
             .await
         {
-            Ok((resp, _, _)) => {
-                buffered_json(&resp).and_then(|j| super::advisor::extract_advice_text(&j))
-            }
+            Ok((resp, _, _)) => buffer_response_for_advisor(resp)
+                .await
+                .ok()
+                .and_then(|resp| buffered_json(&resp))
+                .and_then(|j| super::advisor::extract_advice_text(&j)),
             Err(e) => {
                 log::warn!("[Advisor] 子调用失败，回注「不可用」让 executor 继续: {e}");
                 None
@@ -3239,6 +3268,23 @@ fn is_claude_messages_path(path: &str) -> bool {
 /// （切片 1 沿用 executor 值；此仅为防御性兜底，正常 Claude Code 请求恒有 max_tokens。）
 const DEFAULT_ADVISOR_MAX_TOKENS: u64 = 8192;
 
+/// 把 advisor 回路内的成功响应统一缓冲为 `Buffered` 变体。
+///
+/// failover 关闭（默认配置）时 `non_streaming_timeout` 为 0，
+/// `prepare_success_response_for_failover` 会原样返回未缓冲的 `Hyper`/`Reqwest` 响应，
+/// 而 `buffered_json` 只认 `Buffered`——回路不能依赖 failover 的缓冲副作用（否则默认
+/// 配置下 executor 的 advisor 调用被当终态静默返回，codex P1），须自行缓冲。
+/// 压缩体不在这一层解压：保留原 `Content-Encoding` 头，交 `buffered_json` 统一处理。
+async fn buffer_response_for_advisor(response: ProxyResponse) -> Result<ProxyResponse, ProxyError> {
+    if matches!(response, ProxyResponse::Buffered { .. }) {
+        return Ok(response);
+    }
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES).await?;
+    Ok(ProxyResponse::buffered(status, headers, body))
+}
+
 /// 读取非流式（Buffered）响应体并解析为 JSON；非 Buffered 或解析失败返回 None。
 ///
 /// 上游可能对非流式透传响应压缩（`Content-Encoding: gzip/br/zstd`）；reqwest 未启用
@@ -3269,8 +3315,9 @@ fn is_advisor_block_rejection(error: &ProxyError) -> bool {
 
 /// advisor 回路中最近一次注入的 `advisor_tool_result` 回注快照。
 ///
-/// 仅当本轮回注为 `advisor_tool_result` 形状时记录，供下游拒绝该未知块（400/422）时
-/// 回退重发普通 `tool_result`：截断到 `base_len`、用同一份内容以 `tool_result` 重建。
+/// 仅当本轮回注为 `advisor_tool_result` 形状时记录，供下游拒绝该未知块（400/422，或
+/// 2xx 错误信封）时回退重发普通 `tool_result`：截断到 `base_len`、用同一份内容以
+/// `tool_result` 重建。
 struct PendingInjection {
     /// 追加回注前 `messages` 的长度（回退时截断至此）。
     base_len: usize,
@@ -3280,6 +3327,21 @@ struct PendingInjection {
     tool_use_ids: Vec<String>,
     /// 建议明文。
     advice: String,
+}
+
+/// 把回退快照重建为普通 `tool_result` 回注：截断 `messages` 至 `base_len`、用同一份
+/// 内容以 `tool_result` 形状重建。「下游拒绝 `advisor_tool_result`」的两条路径
+/// （HTTP 400/422 与 2xx 错误信封）共用。
+fn rebuild_continuation_as_tool_result(loop_body: &mut Value, pending: &PendingInjection) {
+    if let Some(arr) = loop_body.get_mut("messages").and_then(Value::as_array_mut) {
+        arr.truncate(pending.base_len);
+        arr.extend(super::advisor::build_continuation(
+            &pending.assistant_content,
+            &pending.tool_use_ids,
+            &pending.advice,
+            super::advisor::InjectShape::ToolResult,
+        ));
+    }
 }
 
 fn rewrite_codex_responses_endpoint_to_chat(endpoint: &str) -> (String, Option<String>) {
@@ -3760,6 +3822,7 @@ fn summarize_text_for_log(text: &str, max_chars: usize) -> String {
 fn apply_local_proxy_body_overrides(
     body: &mut Value,
     overrides: &LocalProxyRequestOverrides,
+    skip_messages: bool,
 ) -> bool {
     let Some(override_body) = overrides.body.as_ref() else {
         return false;
@@ -3768,6 +3831,24 @@ fn apply_local_proxy_body_overrides(
     if !override_body.is_object() {
         log::warn!("[LocalProxyOverrides] Ignoring body override because it is not an object");
         return false;
+    }
+
+    // advisor 回路内 messages 由回路管理（回注依赖追加语义）；`body.messages` 覆盖是
+    // 整组替换，会吞掉回注让 executor 每轮看到相同请求 → 无限付费循环（codex P1）。
+    // 跳过该键，其余字段照常覆盖。
+    if skip_messages && override_body.get("messages").is_some() {
+        let mut patch = override_body.clone();
+        if let Some(obj) = patch.as_object_mut() {
+            obj.remove("messages");
+        }
+        log::warn!(
+            "[Advisor] localProxyRequestOverrides.body.messages 为整组替换、会吞掉 advisor \
+             回注，advisor 回路内跳过该键（其余覆盖照常生效）"
+        );
+        if patch.as_object().is_some_and(|o| o.is_empty()) {
+            return false;
+        }
+        return merge_json_override(body, &patch);
     }
 
     merge_json_override(body, override_body)
@@ -4229,6 +4310,41 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_continuation_as_tool_result_truncates_and_rebuilds() {
+        // 回退：截断到 base_len、同一份内容以 tool_result 重建（400/422 与 2xx 信封共用）。
+        let mut body = json!({
+            "messages": [
+                { "role": "user", "content": "q" },
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "toolu_a", "name": "advisor", "input": {} }
+                ] },
+                { "role": "user", "content": [
+                    { "type": "advisor_tool_result", "tool_use_id": "toolu_a",
+                      "content": { "type": "advisor_result", "text": "建议" } }
+                ] }
+            ]
+        });
+        let pending = PendingInjection {
+            base_len: 1,
+            assistant_content: json!([
+                { "type": "tool_use", "id": "toolu_a", "name": "advisor", "input": {} }
+            ]),
+            tool_use_ids: vec!["toolu_a".to_string()],
+            advice: "建议".to_string(),
+        };
+
+        rebuild_continuation_as_tool_result(&mut body, &pending);
+
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(
+            msgs[2]["content"][0],
+            json!({ "type": "tool_result", "tool_use_id": "toolu_a", "content": "建议" })
+        );
+    }
+
+    #[test]
     fn local_proxy_body_overrides_deep_merge_final_body_without_stream() {
         let mut body = json!({
             "model": "before",
@@ -4252,7 +4368,9 @@ mod tests {
             })),
         };
 
-        assert!(apply_local_proxy_body_overrides(&mut body, &overrides));
+        assert!(apply_local_proxy_body_overrides(
+            &mut body, &overrides, false
+        ));
 
         assert_eq!(body["model"], "after");
         assert_eq!(body["stream"], false);
@@ -4260,6 +4378,57 @@ mod tests {
         assert_eq!(body["metadata"]["temperature"], 0.2);
         assert_eq!(body["metadata"]["top_p"], 0.9);
         assert_eq!(body["messages"], json!([]));
+    }
+
+    #[test]
+    fn local_proxy_body_overrides_skip_messages_keeps_conversation() {
+        // advisor 回路内（skip_messages=true）：body.messages 覆盖被跳过（整组替换会
+        // 吞掉回注，codex P1），其余字段照常生效。
+        let mut body = json!({
+            "model": "before",
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        let overrides = LocalProxyRequestOverrides {
+            headers: HashMap::new(),
+            body: Some(json!({
+                "model": "after",
+                "messages": [{ "role": "user", "content": "replaced" }]
+            })),
+        };
+
+        assert!(apply_local_proxy_body_overrides(
+            &mut body, &overrides, true
+        ));
+
+        assert_eq!(body["model"], "after");
+        assert_eq!(
+            body["messages"],
+            json!([{ "role": "user", "content": "hello" }])
+        );
+    }
+
+    #[test]
+    fn local_proxy_body_overrides_skip_messages_with_only_messages_patch() {
+        // patch 只含 messages：剥掉后为空 → 无任何改动。
+        let mut body = json!({
+            "model": "keep",
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        let overrides = LocalProxyRequestOverrides {
+            headers: HashMap::new(),
+            body: Some(json!({ "messages": [] })),
+        };
+
+        assert!(!apply_local_proxy_body_overrides(
+            &mut body, &overrides, true
+        ));
+
+        assert_eq!(body["model"], "keep");
+        assert_eq!(
+            body["messages"],
+            json!([{ "role": "user", "content": "hello" }])
+        );
     }
 
     #[test]
